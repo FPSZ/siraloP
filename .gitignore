@@ -1,0 +1,17 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python / build
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+
+# 本地抓取缓存 / 临时产物
+scratch/
+tmp/
+*.log

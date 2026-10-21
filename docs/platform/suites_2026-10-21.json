@@ -1,0 +1,409 @@
+{
+  "items": [
+    {
+      "id": "2b3aecd6540b47419d45c294def49773",
+      "title": "GAUNTLET",
+      "title_i18n": {
+        "en": "GAUNTLET"
+      },
+      "description": {
+        "en": "Enterprise-scale cyber ranges. One engagement, one written report.",
+        "zh-CN": "企业规模的网络靶场。一次交战，一份书面报告。"
+      },
+      "type": "hands_on",
+      "challenge_count": 4,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 4
+        }
+      ],
+      "difficulty": {
+        "easy": 0,
+        "medium": 0,
+        "hard": 4
+      },
+      "environment": "vpn",
+      "model_count": 1,
+      "run_count": 25,
+      "practitioner_count": 0,
+      "small_sample": true,
+      "best_model": {
+        "label": "DeepSeek V4 Flash (Claude Code)",
+        "percent": 0
+      },
+      "best_human": null,
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "3a5ea9fff91e4585b213c43a9d31b96e",
+      "title": "UPLOADLABS",
+      "title_i18n": {
+        "en": "UPLOADLABS"
+      },
+      "description": {
+        "en": "Atomic file-upload bypass levels, one restriction per level.",
+        "zh-CN": "文件上传绕过的原子关卡，每关一道限制。"
+      },
+      "type": "hands_on",
+      "challenge_count": 21,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 21
+        }
+      ],
+      "difficulty": {
+        "easy": 2,
+        "medium": 11,
+        "hard": 8
+      },
+      "environment": "instance",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 1,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 100
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "4394a10aa5d24f97a1ec3301ca718a45",
+      "title": "CTFARENA",
+      "title_i18n": {
+        "en": "CTFARENA"
+      },
+      "description": {
+        "en": "Challenges designed for this platform: web, pwn, reverse and crypto.",
+        "zh-CN": "为本平台设计的题目：Web、Pwn、逆向与密码学。"
+      },
+      "type": "hands_on",
+      "challenge_count": 115,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 115
+        }
+      ],
+      "difficulty": {
+        "easy": 7,
+        "medium": 48,
+        "hard": 60
+      },
+      "environment": "mixed",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 5,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Auto-Pentest （deepseek-v4-pro）",
+        "percent": 84.3
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "52f4b0d57e644549934e343813a9ad8e",
+      "title": "CVE",
+      "title_i18n": {
+        "en": "CVE"
+      },
+      "description": {
+        "en": "Replications of published CVEs, each in its own container.",
+        "zh-CN": "已公开 CVE 的复现环境，每个 CVE 一套容器。"
+      },
+      "type": "hands_on",
+      "challenge_count": 1474,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 1474
+        }
+      ],
+      "difficulty": {
+        "easy": 116,
+        "medium": 1226,
+        "hard": 132
+      },
+      "environment": "instance",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 2,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 5.6
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "9f613f261b68469b9c4da805197983b2",
+      "title": "AGENTBENCH",
+      "title_i18n": {
+        "en": "AGENTBENCH"
+      },
+      "description": {
+        "en": "Application security for LLM agents. The target runs a real language model.",
+        "zh-CN": "面向 LLM 智能体的应用安全。目标内部运行真实语言模型。"
+      },
+      "type": "hands_on",
+      "challenge_count": 5,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 5
+        }
+      ],
+      "difficulty": {
+        "easy": 1,
+        "medium": 2,
+        "hard": 2
+      },
+      "environment": "instance",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 1,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 40
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "d35cc057773c44f79eec192b54551327",
+      "title": "CYBENCH",
+      "title_i18n": {
+        "en": "CYBENCH"
+      },
+      "description": {
+        "en": "Ports of the cybench corpus: tasks taken from real CTF competitions.",
+        "zh-CN": "cybench 语料的移植版本：题目取自真实 CTF 比赛。"
+      },
+      "type": "hands_on",
+      "challenge_count": 40,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 40
+        }
+      ],
+      "difficulty": {
+        "easy": 11,
+        "medium": 27,
+        "hard": 2
+      },
+      "environment": "mixed",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 1,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 30
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "d4917609895644e1bcf92b3c9b3bc70f",
+      "title": "AGENT-DEFENSE",
+      "title_i18n": {
+        "en": "AGENT-DEFENSE"
+      },
+      "description": {
+        "en": "Robustness against deception: planted banners, honeypot services and misleading files.",
+        "zh-CN": "抗欺骗鲁棒性：伪造的横幅、蜜罐服务与名实不符的文件。"
+      },
+      "type": "hands_on",
+      "challenge_count": 37,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 37
+        }
+      ],
+      "difficulty": {
+        "easy": 5,
+        "medium": 20,
+        "hard": 12
+      },
+      "environment": "instance",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 1,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 100
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "e236cf74b397436d94577142e5cdb528",
+      "title": "XBOW",
+      "title_i18n": {
+        "en": "XBOW"
+      },
+      "description": {
+        "en": "Ports of the XBOW validation benchmarks: real web vulnerability classes.",
+        "zh-CN": "XBOW 验证基准的移植版本：真实的 Web 漏洞类型。"
+      },
+      "type": "hands_on",
+      "challenge_count": 104,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 104
+        }
+      ],
+      "difficulty": {
+        "easy": 45,
+        "medium": 51,
+        "hard": 8
+      },
+      "environment": "vpn",
+      "model_count": 6,
+      "run_count": 725,
+      "practitioner_count": 4,
+      "small_sample": false,
+      "best_model": {
+        "label": "DeepSeek V4 Flash (Claude Code)",
+        "percent": 79.6
+      },
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 100
+      },
+      "agents_allowed": true,
+      "hosted_eval": true
+    },
+    {
+      "id": "e4e78ff318dc4844beac13f9ea7409aa",
+      "title": "SAMPLE",
+      "title_i18n": {
+        "en": "SAMPLE"
+      },
+      "description": {
+        "en": "Reference challenges demonstrating each platform feature.",
+        "zh-CN": "演示平台各项特性的参考题目。"
+      },
+      "type": "hands_on",
+      "challenge_count": 14,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 6
+        },
+        {
+          "category": "reverse",
+          "count": 3
+        },
+        {
+          "category": "misc",
+          "count": 2
+        },
+        {
+          "category": "pwn",
+          "count": 2
+        },
+        {
+          "category": "crypto",
+          "count": 1
+        }
+      ],
+      "difficulty": {
+        "easy": 11,
+        "medium": 3,
+        "hard": 0
+      },
+      "environment": "mixed",
+      "model_count": 1,
+      "run_count": 7,
+      "practitioner_count": 2,
+      "small_sample": true,
+      "best_model": {
+        "label": "DeepSeek V4 Flash (Claude Code)",
+        "percent": 25
+      },
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 100
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    },
+    {
+      "id": "f2348cfef1994a8082fedeb324efdbdc",
+      "title": "SQLILABS",
+      "title_i18n": {
+        "en": "SQLILABS"
+      },
+      "description": {
+        "en": "Atomic SQL-injection levels, one technique per level.",
+        "zh-CN": "SQL 注入的原子关卡，每关一个技巧。"
+      },
+      "type": "hands_on",
+      "challenge_count": 69,
+      "version": "",
+      "version_pinned": false,
+      "categories": [
+        {
+          "category": "web",
+          "count": 69
+        }
+      ],
+      "difficulty": {
+        "easy": 19,
+        "medium": 43,
+        "hard": 7
+      },
+      "environment": "instance",
+      "model_count": 0,
+      "run_count": 0,
+      "practitioner_count": 4,
+      "small_sample": false,
+      "best_model": null,
+      "best_human": {
+        "label": "Thanatos's team",
+        "percent": 100
+      },
+      "agents_allowed": true,
+      "hosted_eval": false
+    }
+  ],
+  "total": 10,
+  "limit": 50,
+  "offset": 0
+}
