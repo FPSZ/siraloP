@@ -14,6 +14,7 @@
 - **奖金**：智能体赛道冠/亚/季 = 2万/1万/5千，另有两个单项奖各 3千/2千；都带 CCF 盖章证书。比人机协同赛道奖金高一档。
 - **评分**：按 flag 数排名，同分比最早解出时间 → **又快又多**。
 - **最大杠杆（平台自带评测榜实测）**：**"Claude Code 外壳 + 便宜的国产 flash 模型"** 性价比碾压；平台提供模型网关，GLM/DeepSeek/Kimi 都能走。Web 题现有 agent 已能解 ~75%，但 **AI 安全/蜜罐/多步企业靶场/间接提示注入类接近 0%**——这几类是胜负手。
+- **2026 制胜范式（全网竞品印证，详见 §8）**：**多模型并行竞速（蜂群）+ 协调器复盘喂提示**，而非单 agent 死磕；外壳>模型。最快起步 = **fork `verialabs/ctf-agent`（BSidesSF 2026 冠军）把 CTFd 适配层换成 CTFY-0001/MCP**。
 - **练习无门槛**：平台有 6000+ 道公开练习题（CTFARENA/XBOW/SQLILABS/UPLOADLABS/AGENTBENCH/AGENT-DEFENSE 等），随时可打，就是我们的训练场。
 
 ---
@@ -164,11 +165,36 @@
 
 **重点仓库**：SWE-agent/EnIGMA、cybench、NYU-LLM-CTF/nyuctf_agents、aliasrobotics/cai、PentestGPT、ethz-spylab/agentdojo。论文见文末链接。
 
-## 8. 我们的行动清单（建议）
+## 8. 2026 最新可借鉴的竞品 Agent [全网调研]
+
+> 按对我们赛道（CTFy/全自动/Web-Pwn-AI）的可借鉴度排序。多数战绩为项目方自述，已标注。**核心发现与平台评测榜完全印证：2026 制胜范式 = 多模型并行竞速（蜂群）+ 协调器复盘喂提示；外壳比模型更重要。**
+
+**① verialabs/ctf-agent —— 最对口，建议直接做蓝本（MIT）**
+- 战绩：**BSidesSF 2026 CTF 第一，52/52 全解**（~870★）。
+- 架构（几乎同形态）：**协调器 LLM** 轮询平台 → 每题拉起**多模型蜂群并行竞速，谁先拿 flag 谁赢** → solver 间**消息总线**共享发现、可中途喂提示 → 每个 solver 跑在**预装全套 CTF 工具的独立 Docker 沙箱**。
+- 默认阵容：Claude Opus 4.6 + GPT-5.4 Codex（综合最强）+ GPT-5.4-mini（简单题）+ GPT-5.3-codex。
+- ⚠️ 对接 **CTFd**，不是 CTFy → 把轮询/交 flag 适配层换成 **CTFY-0001/MCP** 即可，其余结构可照搬。<https://github.com/verialabs/ctf-agent>
+
+**② STRIATUM-CTF —— MCP 架构，和 CTFy 同路子**
+- 战绩：某高校赛**力压 21 支人类队第一**（自述）；消融 86.7%。
+- 关键结论：**"协议层"比长 prompt 更重要**——强制工具调用符合 schema、调错自动触发自纠正循环，保持长利用链上下文连贯。**CTFy 本身 MCP 原生，直接适用。** <https://arxiv.org/pdf/2603.22577>
+
+**③ 其他可参考**
+- **Muteki（無敵）**：多 Agent 蜂群，整合 Claude Code+Codex+Cursor，约 3h 打完 RIFFHACK 2026（自述）。
+- **CAI**（aliasrobotics）：老牌，"AI vs Human" 现场赛拿过 AI 队第一；⚠️ **2026-08 已归档停更**，仅作架构参考。
+- **CTF-BTFly / SageCTF(OpenSage)**：容器化多模型 / DEF CON CTF 2026 单打进前 5%（686 队，自述）。
+
+**④ 自动渗透 & 顶级工程参考（偏找洞/补洞，非 jeopardy）**
+- **XBOW**：全自动 Web 渗透，称达顶级人类水平、HackerOne 提交 1060+ 漏洞（闭源；独立评测对"全自动"有保留）。**Strix**：开源渗透 Agent ~66k★。
+- **AIxCC**（DEF CON 33, 2025-08，DARPA $4M）：Team Atlanta **ATLANTIS** 冠军、Trail of Bits **Buttercup** 亚军**且开源**、Theori 季军；自动找洞+打补丁的天花板级工程，<https://trailofbits.com/buttercup/>。
+
+**→ 最快起步路径：fork `verialabs/ctf-agent`，把 CTFd 适配层换成 CTFY-0001/MCP；协调器+蜂群保留，底层模型换成平台网关可用的便宜 flash（GLM/DeepSeek/Kimi），按 STRIATUM 思路加工具 schema 强约束与自纠正。**
+
+## 9. 我们的行动清单（建议）
 
 **立即（报名窗口内，11/13 前）**
 - [ ] 平台注册、建队（≤4 人同单位）、提交报名审核；加 QQ 群 1053114117 / Discord 盯通知。
-- [ ] 跑通最小闭环：按 CTFY-0001 写一个"能连平台、拉题、交 flag"的骨架 Agent，先用**连接式(MCP)** 验证，再做**镜像式**并过 `ctfy agent check`。
+- [ ] 跑通最小闭环：按 CTFY-0001 写一个"能连平台、拉题、交 flag"的骨架 Agent，先用**连接式(MCP)** 验证，再做**镜像式**并过 `ctfy agent check`。**起步建议直接 fork `verialabs/ctf-agent`（见 §8）改 CTFd→CTFY 适配层，省去从零搭蜂群。**
 - [ ] 选型 A/B 测：以 **Claude-Code 类外壳 + GLM-flash/DeepSeek-flash** 为基线，在 XBOW/CTFARENA 练习题上刷 solve_rate 和成本。
 
 **赛前打磨**
@@ -177,7 +203,7 @@
 - [ ] 工程稳健性：TLS+SNI 客户端、离线镜像（依赖全打包）、gated 多问轮询、`competition_paused` 按时 sleep、失败也要写 `result.json`、token/turn 预算控制。
 - [ ] 若冲**创新单项奖**：按 CTFY-0002 让 Agent 能自动产出一道合规题目包并过 smoke。
 
-## 9. 待确认（去群里问/等手册）
+## 10. 待确认（去群里问/等手册）
 - 智能体赛道最终以**连接式**还是**提交镜像式**计分？"提交 AI 智能体程序"的具体提交形态与截止点。
 - 比赛期间模型网关提供哪些模型、是否有 token/经费额度上限（评测榜出现 GLM/DeepSeek/Kimi）。
 - 出题环节是否纳入主排名，还是仅对应"创新单项奖"；3 个出题窗口的具体规则。
