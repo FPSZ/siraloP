@@ -1,0 +1,85 @@
+[project]
+name = "ctfy-agent"
+version = "0.1.0"
+description = "Autonomous agent for the Jinghua Cup TPCTF 2026 agent track (authorized collegiate security competition)."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "anyio>=4.4",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# model gateway client is optional: the GatewayAdapter speaks the wire format
+# directly over httpx, so litellm is only for teams who prefer it.
+model = ["litellm>=1.40"]
+# dev-only: local per-challenge containers (needs a running docker daemon)
+docker = ["aiodocker>=0.24"]
+# platform MCP transport
+mcp = ["mcp>=1.0"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "import-linter>=2.0",
+]
+
+[project.scripts]
+# image-mode entrypoint also runnable as:  python -m agent.entrypoints.image_main
+ctfy-agent = "agent.entrypoints.cli_main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["external-agents", ".venv", "build", "docs"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["external-agents"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# (str, Enum) is an intentional, explicit style in domain/state.py; UP042's
+# StrEnum rewrite would change str()/JSON-serialization behavior, so skip it.
+ignore = ["UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+namespace_packages = true
+explicit_package_bases = true
+exclude = "(^|/)(external-agents|build)/"
+
+# --- Hexagon boundaries (enforced by import-linter: `lint-imports`) -----------
+[tool.importlinter]
+root_package = "agent"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain stays pure (no adapters, no composition root, no HTTP/async-IO libs)"
+type = "forbidden"
+source_modules = ["agent.domain"]
+forbidden_modules = ["agent.adapters", "agent.wiring", "agent.entrypoints", "httpx", "anyio"]
+
+[[tool.importlinter.contracts]]
+name = "Ports are abstractions only"
+type = "forbidden"
+source_modules = ["agent.ports"]
+forbidden_modules = ["agent.adapters", "agent.wiring", "agent.entrypoints", "httpx"]
+
+[[tool.importlinter.contracts]]
+name = "Adapters never import the composition root or entrypoints"
+type = "forbidden"
+source_modules = ["agent.adapters"]
+forbidden_modules = ["agent.wiring", "agent.entrypoints"]

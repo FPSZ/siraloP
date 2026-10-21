@@ -1,0 +1,17 @@
+# Code owners — auto-requests review when a path changes.
+# Replace @FPSZ with the real GitHub handles/teams as the team grows.
+
+# Default owner for everything.
+*                      @FPSZ
+
+# The frozen contracts: ports + the shared data model. Changing these ripples
+# across every adapter and the domain, so they get the most careful review.
+/agent/ports/          @FPSZ
+/agent/domain/state.py @FPSZ
+
+# Composition root: the only place environments are swapped.
+/agent/wiring.py       @FPSZ
+
+# The platform/image contract docs and ADRs.
+/docs/standards/       @FPSZ
+/docs/adr/             @FPSZ

@@ -1,0 +1,49 @@
+# ctfy-agent
+
+> Autonomous agent for the Jinghua Cup TPCTF 2026 agent track (an authorized
+> collegiate security competition). Hexagonal Python: a pure domain core, frozen
+> Protocol ports, and swappable I/O adapters. It reads challenges from the
+> platform, works them in the provided challenge environment, and submits answers
+> the platform grader verifies. This is the defensive framework/engine.
+
+Start here. Read AGENTS.md before editing anything; respect the frozen ports and
+the "domain stays pure" rule (enforced by import-linter). Tests use shipped fakes
+and never touch the real network.
+
+## Start here
+- [AGENTS.md](../AGENTS.md): working agreement — architecture, rules, how to add an adapter
+- [CONTRIBUTING.md](../CONTRIBUTING.md): setup, PR loop, what needs extra care
+- [README.md](../README.md): project overview
+
+## Architecture & decisions
+- [docs/adr/0001-agent-architecture.md](adr/0001-agent-architecture.md): Python + hexagonal, directory layout, ports, data flow
+- [docs/adr/0002-domain-block-architecture.md](adr/0002-domain-block-architecture.md): control loop, tool layer, context, model layer
+- [docs/adr/0003-dev-conventions.md](adr/0003-dev-conventions.md): testing, tooling, collaboration conventions
+
+## Platform contract
+- [docs/standards/CTFY-0001_agent-protocol.md](standards/CTFY-0001_agent-protocol.md): image/env/result.json contract
+- [docs/standards/CTFY-0002_challenge-package.md](standards/CTFY-0002_challenge-package.md): challenge/question/grading model
+- [docs/京华杯TPCTF2026_智能体赛道_资料汇总.md](京华杯TPCTF2026_智能体赛道_资料汇总.md): competition research digest
+
+## Code: contracts (frozen)
+- [agent/ports/](../agent/ports/): platform, llm, execution, result, clock — the Protocols
+- [agent/domain/state.py](../agent/domain/state.py): the shared data model (merge hotspot)
+
+## Code: domain (pure)
+- [agent/domain/coordinator.py](../agent/domain/coordinator.py): ROI scheduler over challenges
+- [agent/domain/swarm.py](../agent/domain/swarm.py): race solver lanes, first verified flag wins
+- [agent/domain/solver.py](../agent/domain/solver.py): ReAct + CLI-harness solver strategies
+- [agent/domain/policy.py](../agent/domain/policy.py): flag check, stop-loss, untrusted-input rule
+
+## Code: adapters (I/O) & wiring
+- [agent/adapters/platform/ctfy_rest.py](../agent/adapters/platform/ctfy_rest.py): PlatformPort over HTTP
+- [agent/adapters/llm/gateway.py](../agent/adapters/llm/gateway.py): LLMPort over the model gateway
+- [agent/adapters/execution/subprocess_exec.py](../agent/adapters/execution/subprocess_exec.py): ExecutionPort via subprocesses
+- [agent/adapters/result/ctfy_result.py](../agent/adapters/result/ctfy_result.py): atomic, scrubbed result.json
+- [agent/wiring.py](../agent/wiring.py): composition root (build_for_image / build_for_dev)
+- [agent/entrypoints/image_main.py](../agent/entrypoints/image_main.py): submission entrypoint
+
+## Testing
+- [agent/testing/fakes.py](../agent/testing/fakes.py): one in-memory fake per port
+- [tests/AGENTS.md](../tests/AGENTS.md): how we test (fakes-first, no real network)
+- [tools/check.py](../tools/check.py): the gate — ruff + import-linter + pytest (+ mypy advisory)

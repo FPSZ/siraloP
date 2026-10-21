@@ -1,0 +1,1 @@
+"""Driving adapters (entrypoints)."""

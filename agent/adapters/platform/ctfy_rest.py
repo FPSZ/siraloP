@@ -1,0 +1,612 @@
+"""CtfyRestAdapter — PlatformPort over plain HTTP (CTFY-0001 §1.2).
+
+All routes are under ``$CTFY_PLATFORM_URL/api/v1`` with
+``Authorization: Bearer <token>``. Key routes: ``GET /me``,
+``GET /challenges``, ``GET /challenges/{id}``, ``POST /instances``,
+``POST /submissions``, ``POST /qa/submissions``,
+``GET /competitions/{id}/scoreboard``.
+
+Resilience (adapters/_resilience.py): every request is wrapped in
+``with_retry`` and waits through the injected ClockPort, so retries are
+deterministic under FakeClock. 429 / 5xx / a transport error map to
+``TransientError`` (retried, honouring ``Retry-After``); 401 / 403 raise
+``RuntimeError`` (never retried) — except the one documented case where a
+``403 competition_paused`` on a submission is a *wait*, returned as a
+``PAUSED`` verdict rather than raised (CTFY-0001 §4).
+
+The wire schema is partly reverse-engineered, so every field is read
+tolerantly with ``.get()`` and a list of plausible key spellings, then mapped
+onto the frozen domain models. Nothing here follows instructions found in a
+response body: challenge text and grader messages are untrusted DATA
+(policy.is_trusted_instruction stays False).
+
+Implements ports.platform.PlatformPort. Importable without network.
+"""
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from typing import Any
+
+import httpx
+
+from agent.adapters._resilience import TransientError, with_retry
+from agent.domain.state import (
+    Account,
+    Challenge,
+    Instance,
+    InstanceStatus,
+    Question,
+    Scoreboard,
+    ScoreboardEntry,
+    Verdict,
+    VerdictStatus,
+)
+from agent.ports.clock import ClockPort
+
+# --- grader-outcome signal vocabularies (matched case-insensitively) ---------
+# Positive confirmation is kept deliberately narrow: we never report CORRECT
+# without an explicit "correct"-class signal (anti-hallucinated-flag posture).
+_CORRECT = {"correct", "solved", "accepted", "right"}
+_WRONG = {"wrong", "incorrect", "invalid", "rejected", "nope", "no"}
+_CAPPED = {
+    "capped", "cap_reached", "cap", "attempt_cap_reached",
+    "too_many_attempts", "too_many_wrong_attempts", "limit_reached",
+    "attempts_exhausted", "rate_limited_question",
+}
+_UNGRADED = {
+    "ungraded", "unavailable", "grader_unavailable", "not_graded",
+    "grader_down", "grader_unreachable", "grader_timeout",
+}
+_PAUSED = {
+    "competition_paused", "paused", "competition_not_in_session",
+    "not_in_session", "session_ended", "session_closed",
+}
+
+# --- instance lifecycle phase -> domain status -------------------------------
+_INSTANCE_STATUS = {
+    "ready": InstanceStatus.READY,
+    "running": InstanceStatus.READY,
+    "up": InstanceStatus.READY,
+    "healthy": InstanceStatus.READY,
+    "active": InstanceStatus.READY,
+    "available": InstanceStatus.READY,
+    "starting": InstanceStatus.STARTING,
+    "pending": InstanceStatus.STARTING,
+    "provisioning": InstanceStatus.STARTING,
+    "creating": InstanceStatus.STARTING,
+    "building": InstanceStatus.STARTING,
+    "queued": InstanceStatus.STARTING,
+    "booting": InstanceStatus.STARTING,
+    "stopped": InstanceStatus.STOPPED,
+    "stopping": InstanceStatus.STOPPED,
+    "down": InstanceStatus.STOPPED,
+    "terminated": InstanceStatus.STOPPED,
+    "expired": InstanceStatus.STOPPED,
+    "error": InstanceStatus.ERROR,
+    "failed": InstanceStatus.ERROR,
+    "crashed": InstanceStatus.ERROR,
+}
+
+
+class CtfyRestAdapter:
+    """PlatformPort talking to the ctfy platform REST API over HTTP."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        *,
+        clock: ClockPort,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._base = base_url.rstrip("/") + "/api/v1"
+        # The token lives only in a header built here; never logged or persisted.
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        self._clock = clock
+        # Construction opens no connection (httpx is lazy), so import/build is
+        # network-free. An injected client is reused as-is and never closed by us.
+        self._client = client if client is not None else httpx.AsyncClient(timeout=30)
+        self._owns_client = client is None
+
+    # ------------------------------------------------------------------ port --
+    async def whoami(self) -> Account:
+        resp = await self._request("GET", "/me")
+        self._checked(resp, "GET /me")
+        d = self._unwrap(self._json_dict(resp), "data", "user", "account", "result")
+        return Account(
+            id=self._as_str(self._pick(d, "id", "user_id", "account_id", "uid", "sub")),
+            name=self._as_str(
+                self._pick(d, "name", "username", "display_name", "handle",
+                           "team", "team_name", default="")
+            ),
+        )
+
+    async def list_challenges(self) -> list[Challenge]:
+        resp = await self._request("GET", "/challenges")
+        self._checked(resp, "GET /challenges")
+        items = self._as_list(
+            self._json(resp), "challenges", "data", "items", "results"
+        )
+        out: list[Challenge] = []
+        for c in items:
+            parsed = self._parse_challenge(c)
+            if parsed is not None:
+                out.append(parsed)
+        return out
+
+    async def get_challenge(self, cid: str) -> Challenge:
+        resp = await self._request("GET", f"/challenges/{cid}")
+        self._checked(resp, f"GET /challenges/{cid}")
+        d = self._unwrap(self._json_dict(resp), "data", "challenge", "result")
+        if isinstance(d, dict):
+            d.setdefault("id", cid)  # guarantee an id even if the body omits it
+        parsed = self._parse_challenge(d)
+        if parsed is None:
+            raise RuntimeError(
+                f"GET /challenges/{cid}: unparseable response {self._snippet(resp)}"
+            )
+        return parsed
+
+    async def start_instance(self, cid: str) -> Instance:
+        resp = await self._request("POST", "/instances", json={"challenge_id": cid})
+        # A 403 competition_paused is possible here (CTFY-0001 §4); the frozen
+        # PlatformPort returns an Instance with no PAUSED phase, so it surfaces
+        # as RuntimeError via _checked (the message carries the paused code).
+        self._checked(resp, "POST /instances")
+        d = self._unwrap(self._json_dict(resp), "data", "instance", "result")
+        poll = self._as_float(
+            self._pick(d, "poll_after_s", "poll_after", "retry_after_s", "retry_after"),
+            default=None,
+        )
+        if poll is None:
+            poll = self._retry_after(resp)
+        return Instance(
+            id=self._as_str(self._pick(d, "id", "instance_id", "iid", default=cid)),
+            host=self._as_str(
+                self._pick(d, "host", "hostname", "address", "ip", "sni",
+                           "server", default="")
+            ),
+            port=self._as_int(self._pick(d, "port", "tcp_port"), default=443),
+            tls_sni=self._tls_flag(d),
+            status=self._instance_status(d),
+            poll_after_s=poll if poll is not None else 2.0,
+            expires_at=self._expires_at(d),
+        )
+
+    async def submit(self, cid: str, qid: str, answer: str) -> Verdict:
+        resp = await self._request(
+            "POST", "/submissions",
+            json={"challenge_id": cid, "question_id": qid, "submission": answer},
+        )
+        return self._grade(resp)
+
+    async def submit_qa(self, cid: str, qid: str, answer: str) -> Verdict:
+        resp = await self._request(
+            "POST", "/qa/submissions",
+            json={"challenge_id": cid, "question_id": qid, "submission": answer},
+        )
+        return self._grade(resp)
+
+    async def scoreboard(self, competition_id: str) -> Scoreboard:
+        resp = await self._request(
+            "GET", f"/competitions/{competition_id}/scoreboard"
+        )
+        self._checked(resp, f"GET /competitions/{competition_id}/scoreboard")
+        data = self._json(resp)
+        items = self._as_list(
+            data, "entries", "standings", "scoreboard", "data", "results", "teams"
+        )
+        entries = [
+            e for e in (self._parse_entry(x, i) for i, x in enumerate(items))
+            if e is not None
+        ]
+        retry = None
+        if isinstance(data, dict):
+            retry = self._as_float(
+                self._pick(data, "retry_after_s", "retry_after"), default=None
+            )
+            if retry is None:
+                meta = data.get("meta")
+                if isinstance(meta, dict):
+                    retry = self._as_float(
+                        self._pick(meta, "retry_after_s", "retry_after"), default=None
+                    )
+        if retry is None:
+            retry = self._retry_after(resp)
+        return Scoreboard(entries=entries, retry_after_s=retry)
+
+    async def aclose(self) -> None:
+        """Close the HTTP client, but only the one we created ourselves."""
+        if self._owns_client:
+            await self._client.aclose()
+
+    # ------------------------------------------------------------- transport --
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """Send one request, retrying only TransientError (429/5xx/transport).
+
+        A non-retryable status (4xx) is returned to the caller unraised so the
+        caller can map it (auth error, or a gradable submission outcome).
+        """
+        async def _once() -> httpx.Response:
+            return await self._send(method, path, json=json, params=params)
+
+        return await with_retry(_once, clock=self._clock, label=f"{method} {path}")
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        try:
+            resp = await self._client.request(
+                method, self._base + path,
+                headers=self._headers, json=json, params=params,
+            )
+        except httpx.HTTPError as exc:  # transport: connect/read/timeout/protocol
+            raise TransientError(f"{method} {path}: {exc!r}") from exc
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise TransientError(
+                f"{method} {path} -> HTTP {resp.status_code}",
+                retry_after=self._retry_after(resp),
+            )
+        return resp
+
+    def _checked(self, resp: httpx.Response, label: str) -> None:
+        """Raise RuntimeError on any non-2xx left after retry (incl. 401/403)."""
+        if resp.is_success:
+            return
+        kind = "auth failed" if resp.status_code in (401, 403) else "request failed"
+        raise RuntimeError(
+            f"{label}: {kind} (HTTP {resp.status_code}) {self._snippet(resp)}"
+        )
+
+    # --------------------------------------------------------------- grading --
+    def _grade(self, resp: httpx.Response) -> Verdict:
+        """Map a submission response onto a Verdict (CTFY-0001 §4, CTFY-0002 §5).
+
+        Ordinary outcomes (wrong / capped / ungraded / paused) are returned, not
+        raised; only a hard auth failure or a truly unrecognizable error raises.
+        """
+        data = self._json_dict(resp)
+        inner = self._unwrap(data, "data", "result", "submission")
+        merged: dict[str, Any] = {**data, **inner} if isinstance(inner, dict) else data
+        signals = {
+            str(merged[k]).strip().lower()
+            for k in ("code", "status", "result", "verdict", "state", "outcome", "grade")
+            if isinstance(merged.get(k), str)
+        }
+        message = self._as_str(
+            self._pick(merged, "message", "detail", "error", "reason",
+                       "msg", "description", default="")
+        )
+        attempts = self._attempts_left(merged)
+        status = resp.status_code
+
+        # 1) Paused — a wait, never a challenge failure (CTFY-0001 §4).
+        if (
+            status in (409, 423)
+            or (signals & _PAUSED)
+            or self._flag(merged, "paused") is True
+        ):
+            return Verdict(VerdictStatus.PAUSED, self._paused_message(merged, message), attempts)
+
+        # 2) Hard auth / forbidden (non-paused) — not an ordinary outcome.
+        if status in (401, 403):
+            raise RuntimeError(
+                f"submit: auth failed (HTTP {status}) {self._snippet(resp)}"
+            )
+
+        # 3) Cap reached — checked before grading, costs no attempt (CTFY-0002 §5.5).
+        if (signals & _CAPPED) or self._flag(merged, "capped") is True:
+            return Verdict(
+                VerdictStatus.CAPPED, message, attempts if attempts is not None else 0
+            )
+
+        # 4) Grader unavailable — neither right nor wrong, costs no attempt (§5.4).
+        if (signals & _UNGRADED) or self._flag(merged, "graded") is False:
+            return Verdict(VerdictStatus.UNGRADED, message, attempts)
+
+        # 5) Correct — only on an explicit positive signal.
+        if (
+            (signals & _CORRECT)
+            or self._flag(merged, "correct") is True
+            or self._flag(merged, "is_correct") is True
+            or self._flag(merged, "solved") is True
+        ):
+            return Verdict(VerdictStatus.CORRECT, message, attempts)
+
+        # 6) Wrong.
+        if (
+            (signals & _WRONG)
+            or self._flag(merged, "correct") is False
+            or self._flag(merged, "is_correct") is False
+            or self._flag(merged, "solved") is False
+        ):
+            return Verdict(VerdictStatus.WRONG, message, attempts)
+
+        # 7) Unrecognized: a 2xx with no positive signal is treated as WRONG
+        #    (never claim CORRECT without evidence); anything else is an error.
+        if resp.is_success:
+            return Verdict(VerdictStatus.WRONG, message or self._snippet(resp), attempts)
+        raise RuntimeError(
+            f"submit: unexpected response (HTTP {status}) {self._snippet(resp)}"
+        )
+
+    @staticmethod
+    def _paused_message(merged: dict[str, Any], message: str) -> str:
+        parts = [message or "competition paused"]
+        nxt = merged.get("next_session_starts_at")
+        if nxt:
+            parts.append(f"next_session_starts_at={nxt}")
+        ra = merged.get("retry_after_s", merged.get("retry_after"))
+        if ra is not None:
+            parts.append(f"retry_after_s={ra}")
+        return "; ".join(str(p) for p in parts)
+
+    @staticmethod
+    def _attempts_left(d: dict[str, Any]) -> int | None:
+        for k in ("attempts_left", "remaining_attempts", "attempts_remaining",
+                  "remaining", "attempts_left_count"):
+            if d.get(k) is not None:
+                try:
+                    return int(d[k])
+                except (TypeError, ValueError):
+                    pass
+        maxa, used = d.get("max_attempts"), d.get("attempts", d.get("wrong_attempts"))
+        if isinstance(maxa, (int, float)) and isinstance(used, (int, float)):
+            return max(0, int(maxa) - int(used))
+        return None
+
+    # --------------------------------------------------------------- parsing --
+    @classmethod
+    def _parse_challenge(cls, c: Any) -> Challenge | None:
+        if not isinstance(c, dict):
+            return None
+        cid = cls._as_str(cls._pick(c, "id", "challenge_id", "cid", "slug", "key"))
+        if not cid:
+            return None
+        questions: list[Question] = []
+        raw_qs = cls._pick(c, "questions", "question_list", "quests", default=[])
+        if isinstance(raw_qs, list):
+            for q in raw_qs:
+                parsed = cls._parse_question(q)
+                if parsed is not None:
+                    questions.append(parsed)
+        gated_n = cls._as_int(
+            cls._pick(c, "gated_questions", "gated", "gated_count"),
+            default=sum(1 for q in questions if q.locked),
+        )
+        return Challenge(
+            id=cid,
+            name=cls._as_str(cls._pick(c, "name", "title", default="")),
+            category=cls._as_str(cls._pick(c, "category", "cat", default="")),
+            description=cls._as_str(
+                cls._pick(c, "description", "desc", "prompt", "summary", default="")
+            ),
+            questions=questions,
+            gated_questions=gated_n,
+            difficulty=cls._as_str(cls._pick(c, "difficulty", "level", default="")),
+            points=cls._as_int(
+                cls._pick(c, "points", "value", "score", "point"), default=0
+            ),
+            solves=cls._as_int(
+                cls._pick(c, "solves", "solve_count", "solved_count"), default=0
+            ),
+        )
+
+    @classmethod
+    def _parse_question(cls, q: Any) -> Question | None:
+        if not isinstance(q, dict):
+            return None
+        qid = cls._as_str(cls._pick(q, "id", "qid", "question_id", "key"))
+        if not qid:
+            return None
+        return Question(
+            id=qid,
+            prompt=cls._as_str(
+                cls._pick(q, "prompt", "question", "text", "title", default="")
+            ),
+            requires=cls._as_str_list(
+                cls._pick(q, "requires", "depends_on", "gated_by", default=[])
+            ),
+            answered=(
+                cls._flag(q, "answered") is True
+                or cls._flag(q, "solved") is True
+                or cls._flag(q, "is_solved") is True
+            ),
+            locked=cls._flag(q, "locked") is True or cls._flag(q, "gated") is True,
+            choices=cls._as_str_list(cls._pick(q, "choices", "options", default=[])),
+            fmt=cls._as_str(cls._pick(q, "format", "fmt", "mode", "type", default="")),
+        )
+
+    @classmethod
+    def _parse_entry(cls, e: Any, idx: int) -> ScoreboardEntry | None:
+        if not isinstance(e, dict):
+            return None
+        return ScoreboardEntry(
+            rank=cls._as_int(
+                cls._pick(e, "rank", "place", "position", "pos"), default=idx + 1
+            ),
+            team=cls._as_str(
+                cls._pick(e, "team", "team_name", "name", "username",
+                          "handle", default="")
+            ),
+            score=cls._as_float(
+                cls._pick(e, "score", "points", "value", "total"), default=0.0
+            ),
+            solved=cls._as_int(
+                cls._pick(e, "solved", "solves", "solve_count", "num_solved"),
+                default=0,
+            ),
+        )
+
+    @classmethod
+    def _instance_status(cls, d: dict[str, Any]) -> InstanceStatus:
+        raw = cls._pick(d, "status", "state", "phase")
+        if isinstance(raw, str):
+            mapped = _INSTANCE_STATUS.get(raw.strip().lower())
+            if mapped is not None:
+                return mapped
+        ready = cls._flag(d, "ready")
+        if ready is True:
+            return InstanceStatus.READY
+        # No readiness signal: assume still STARTING so the caller polls once
+        # more rather than attacking a service that is not up yet.
+        return InstanceStatus.STARTING
+
+    @classmethod
+    def _tls_flag(cls, d: dict[str, Any]) -> bool:
+        for k in ("tls_sni", "sni", "tls"):
+            flag = cls._flag(d, k)
+            if flag is not None:
+                return flag
+        scheme = cls._as_str(cls._pick(d, "scheme", "protocol", default="")).lower()
+        if scheme in ("https", "tls"):
+            return True
+        if scheme in ("http", "tcp"):
+            return False
+        return True  # platform default: challenge services are TLS+SNI on 443
+
+    def _expires_at(self, d: dict[str, Any]) -> float | None:
+        """Map a server TTL to a monotonic deadline in ClockPort.now scale.
+
+        Only a *relative* lifetime can be mapped (now + ttl); an absolute wall
+        timestamp cannot be converted to the monotonic clock, so it is dropped.
+        """
+        for k in ("expires_in", "expires_in_s", "ttl", "ttl_s", "lifetime_s"):
+            secs = self._as_float(d.get(k), default=None)
+            if secs is not None:
+                return self._clock.now() + secs
+        return None
+
+    # ------------------------------------------------------- response helpers --
+    @staticmethod
+    def _json(resp: httpx.Response) -> Any:
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    @classmethod
+    def _json_dict(cls, resp: httpx.Response) -> dict[str, Any]:
+        data = cls._json(resp)
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _unwrap(d: Any, *keys: str) -> dict[str, Any]:
+        if not isinstance(d, dict):
+            return {}
+        for k in (keys or ("data", "result")):
+            inner = d.get(k)
+            if isinstance(inner, dict):
+                return inner
+        return d
+
+    @staticmethod
+    def _as_list(data: Any, *keys: str) -> list[Any]:
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in keys:
+                v = data.get(k)
+                if isinstance(v, list):
+                    return v
+        return []
+
+    @staticmethod
+    def _retry_after(resp: httpx.Response) -> float | None:
+        """Parse a ``Retry-After`` header: delta-seconds or an HTTP-date."""
+        raw = resp.headers.get("retry-after")
+        if not raw:
+            return None
+        raw = raw.strip()
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(raw)
+            if when is not None:
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=UTC)
+                return max(0.0, (when - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _snippet(resp: httpx.Response, limit: int = 200) -> str:
+        try:
+            text = resp.text
+        except Exception:
+            return ""
+        return " ".join(text.split())[:limit]
+
+    # --------------------------------------------------------- value coercion --
+    @staticmethod
+    def _pick(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return default
+
+    @staticmethod
+    def _flag(d: dict[str, Any], key: str) -> bool | None:
+        """Tri-state read of a boolean-ish field: True / False / None (absent)."""
+        v = d.get(key)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)) and v in (0, 1):
+            return bool(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("true", "1", "yes", "y"):
+                return True
+            if s in ("false", "0", "no", "n"):
+                return False
+        return None
+
+    @staticmethod
+    def _as_str(v: Any, default: str = "") -> str:
+        if isinstance(v, str):
+            return v
+        return default if v is None else str(v)
+
+    @staticmethod
+    def _as_str_list(v: Any) -> list[str]:
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None]
+        if isinstance(v, str) and v.strip():
+            return [v.strip()]
+        return []
+
+    @staticmethod
+    def _as_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return default
+
+    @staticmethod
+    def _as_float(v: Any, default: float | None = None) -> float | None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default

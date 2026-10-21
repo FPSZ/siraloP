@@ -15,3 +15,14 @@ node_modules/
 scratch/
 tmp/
 *.log
+
+# secrets & runtime artifacts (never commit)
+.env
+.env.*
+!.env.example
+result.json
+.result-*.tmp
+chal-*/
+
+# 外部 agent 源码（仅本地研究，禁止上传）
+external-agents/
