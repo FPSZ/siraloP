@@ -138,32 +138,25 @@
 3. **AI 安全**（最可能拉开差距）：按 GeekGame 路数准备——泄 System Prompt、枚举/诱导隐藏工具、写恶意 MCP 端、多层间接注入；覆盖 **LLM/agent 框架的 CVE**（官方写"AI 开源框架及智能体相关漏洞"）；注意限频。
 4. **难度分化大**：Web 从 80+ 解到 1–3 解都有，Pwn 中位数约 10–15 解 → **先吃中低难度题性价比最高**，别死磕零解题。
 
-## 7. AI Agent for CTF 技术现状 [公开文献]
+## 7. AI Agent for CTF 技术现状（2026 最新）[公开文献，仅取近半年]
 
-> 全是公开论文/博客/开源 README 层面；数字为不同口径综述，正式引用前建议核对原始 leaderboard。
+> 均为 2026-04 以后的论文/榜单；数字多为子集/自报口径，正式引用前核对原始来源。**2024 年那批（Cybench 的 Claude 3.5、NYU 的 GPT-4o 等）已过时，本节不采用。**
 
-**基准头条数（现有顶尖 agent 整体解题率仍不高）**：
-- **Cybench**（Stanford，40 职业级 CTF 题）：无提示下最佳 Claude 3.5 Sonnet ~17.5%，GPT-4o 12.5%；存在"人类难度天花板"（解不出首解耗时 >11 分钟的题）。
-- **NYU CTF Bench**（200 题）：裸模型极弱（GPT-4 ~5%），加 agent 后 D-CIPHER/CRAKEN(Claude 3.5) 到 ~22%。
-- **XBOW**：2025 年登顶 HackerOne 美国 VDP 榜，约提交千余漏洞。工程关键：**确定性校验确认命中**（非 LLM 判定）+ 提交前复核。
-- **Project Naptime→Big Sleep**（Google）：首个 agent 在真实软件发现未知内存安全漏洞。
-- **AgentDojo / InjecAgent**（间接提示注入基准）：ReAct-GPT-4 被注入攻破率 ~24%，加攻击提示近翻倍(~47%)；现有防御非万无一失。
+**一句话现状**：前沿模型已基本**刷爆"老 CTF 基准"**，但一遇**原创/实时新题就崩**——京华杯是 Redbud/PKUCC 原创新题，真实难度接近后者，**别被老榜高分误导**。
 
-**开源 CTF agent 的通用架构**（SWE-agent/EnIGMA、Cybench agent、D-CIPHER、CAI、PentestGPT、HackingBuddyGPT）共享骨架：
-- **ACI（Agent-Computer Interface）**：给模型语义清晰、输出可控的命令集而非裸 shell；需补**交互式工具**（debugger、建连）、**长输出摘要**（防爆上下文）、长操作的**运行时控制**。
-- Docker 沙箱执行 + ReAct 循环(thought→action→observation) + 显式记忆/状态摘要；多 agent 分工(Planner+Executor)比单体更稳更省。
-- ⚠️ **强基线提醒**：论文《A Second Look》里**通用 claude-code** 在 30 道 Web 题解出 19/30，与自研架构持平——这与 §5 平台榜"Claude Code 外壳最强"完全吻合，**别过度造轮子，先把通用外壳调好**。
+**最新基准数（2026）**：
+- **Cybench（老基准，已接近饱和）**：第三方 pass@3 榜 alias3(CAI) 85%、**GPT-5.5 82%**、**Opus 4.6 73%**、Opus 4.7/Gemini 3 64%；厂商自报子集更有 Opus 4.7 96%、Claude Mythos ~100%（子集不可比）。
+- **HackTheBox「AI vs Human」**：8 支 AI 队中 **5 支解出 19/20（95%）**，与 403 支人类队同场竞技——顶级 agent 已能比肩强人类队。
+- ⚠️ **换原创/实时题就崩**：**CTFusion**（KAIST，Team Atlanta 同组；live 赛经 MCP 评测）上强模型 pass@3 仅 **5–7%**，且发现联网 agent 会**抄公开题解**（数据污染实锤）；**DeepRed**（VM 靶机按检查点计分）最佳模型仅 **~35%**。→ **老基准高分≈污染，京华杯原创题按单数~三成预期更现实。**
+- **《A Second Look》(2026-05)**：通用 **claude-code 解 30 道 Web 题中的 19 道 = 持平自研架构** → 通用外壳即强基线，与 §5 平台榜、§8 竞品完全吻合，**别过度造轮子**。
 
-**分类强弱（NYU pass@3 口径）**：misc ~27% > reverse ~18% > web ~18% > pwn ~11% ≈ crypto ~10% > forensics ~5%。但**工具环境比类别更决定成败**（Web 要补浏览器/代理类工具，否则落后）。
-**典型失败模式**：①放弃/不作答 ②回合耗尽 ③上下文溢出 ④长程规划差 ⑤**幻觉 flag**。→ 对策：强制 flag 校验闭环、部分得分追踪、显式回合/预算管理、子任务分解。
+**架构共识（2026 竞品，evergreen）**：协调器 + **多模型蜂群竞速** + 消息总线 + Docker 工具沙箱；对模型给**语义清晰、输出可控的工具接口（非裸 shell）**，补交互式调试/建连、长输出摘要、长操作运行时控制；MCP 场景按 STRIATUM 加**工具 schema 强约束 + 调错自纠正**。
+**典型失败模式（仍未变）**：放弃/不作答、回合耗尽、上下文溢出、长程规划差、**幻觉 flag** → 对策：flag 校验闭环、部分得分追踪、显式回合/预算管理、子任务分解。
 
-**抗提示注入/欺骗（对应平台埋的蜜罐与诱导）**：
-- **数据≠指令**：目标/工具返回值一律当不可信数据，其中"指令"绝不执行；单层 Spotlighting 在现代 tool-calling agent 上不可靠。
-- **最有效是数据流/能力限制**：对"参数来自不可信输入且不在任务合法集内"的副作用调用直接拦截，可把攻击成功率降到 <1%。
-- 提示侧重复锚定原始目标可把攻破率 47%→28%；分类器可降到 ~7% 但易误伤。
-- → 工程上**多层叠加**，且**只认赛题 oracle 的 flag 校验、不认题面内嵌的任何指令**。
-
-**重点仓库**：SWE-agent/EnIGMA、cybench、NYU-LLM-CTF/nyuctf_agents、aliasrobotics/cai、PentestGPT、ethz-spylab/agentdojo。论文见文末链接。
+**抗提示注入/欺骗（2026，对应平台埋的蜜罐与诱导）**：
+- **Gray Swan IPI Arena（2026-03，27 万+ 攻击 / 13 前沿模型）**：**无一模型免疫**。
+- 现役最佳明显更稳：**Claude Opus 5** 系统卡自报 IPI 攻击成功率 **2.0%@15 次**（单次 0.2%），远低于 Opus 4.8 的 5.5%；但 **GPT-5.6 Sol 仍 20%** → 选模型也影响抗注入。
+- **LivePI / 自适应攻击论文（2026-05/06）**：**静态基准高估鲁棒性，换自适应攻击就破**。→ 工程上**多层叠加**，且**只认赛题 oracle 的 flag 校验、绝不执行题面/目标内嵌的任何指令**（这正是现有 agent 在抗欺骗类 0% 的点）。
 
 ## 8. 2026 最新可借鉴的竞品 Agent [全网调研]
 
@@ -184,9 +177,9 @@
 - **CAI**（aliasrobotics）：老牌，"AI vs Human" 现场赛拿过 AI 队第一；⚠️ **2026-08 已归档停更**，仅作架构参考。
 - **CTF-BTFly / SageCTF(OpenSage)**：容器化多模型 / DEF CON CTF 2026 单打进前 5%（686 队，自述）。
 
-**④ 自动渗透 & 顶级工程参考（偏找洞/补洞，非 jeopardy）**
-- **XBOW**：全自动 Web 渗透，称达顶级人类水平、HackerOne 提交 1060+ 漏洞（闭源；独立评测对"全自动"有保留）。**Strix**：开源渗透 Agent ~66k★。
-- **AIxCC**（DEF CON 33, 2025-08，DARPA $4M）：Team Atlanta **ATLANTIS** 冠军、Trail of Bits **Buttercup** 亚军**且开源**、Theori 季军；自动找洞+打补丁的天花板级工程，<https://trailofbits.com/buttercup/>。
+**④ 自动渗透参考（偏找洞，非 jeopardy）**
+- **XBOW**（2026-03）：全自动 Web 渗透，称达顶级人类水平、HackerOne 提交 1060+ 漏洞（闭源；独立评测对"全自动"有保留）。**Strix**：开源渗透 Agent ~66k★。
+> （DARPA AIxCC 的 ATLANTIS/Buttercup 虽是天花板级工程，但为 2025-08 赛事、已超半年，这里不展开。）
 
 **→ 最快起步路径：fork `verialabs/ctf-agent`，把 CTFd 适配层换成 CTFY-0001/MCP；协调器+蜂群保留，底层模型换成平台网关可用的便宜 flash（GLM/DeepSeek/Kimi），按 STRIATUM 思路加工具 schema 强约束与自纠正。**
 
@@ -218,8 +211,9 @@
 - CTFy CLI：`pip install "ctfy[client]"` → `ctfy login` / `ctfy mcp` / `ctfy agent check` / `ctfy authoring check`
 - Discord：<https://discord.gg/U4xz78QKzc> ・ QQ 群：1053114117
 
-**技术文献（§7 来源）**
-- Cybench <https://arxiv.org/abs/2408.08926> ・ NYU CTF Bench <https://arxiv.org/abs/2406.05590> ・ EnIGMA <https://arxiv.org/abs/2409.16165> ・ D-CIPHER <https://arxiv.org/abs/2502.10931>
-- AgentDojo <https://arxiv.org/abs/2406.13352> ・ InjecAgent <https://arxiv.org/abs/2403.02691> ・ PentestGPT <https://arxiv.org/abs/2308.06782> ・《A Second Look》<https://arxiv.org/abs/2605.21497>
-- 仓库：SWE-agent/EnIGMA、andyzorigin/cybench、NYU-LLM-CTF/nyuctf_agents、aliasrobotics/cai、GreyDGL/PentestGPT、ethz-spylab/agentdojo
-- XBOW 复盘 <https://xbow.com/blog/top-1-how-xbow-did-it/>
+**技术文献（§7/§8 来源，均 2026 近半年）**
+- CTFusion（KAIST，live 赛 MCP 评测）<https://arxiv.org/abs/2605.11504> ・《A Second Look》<https://arxiv.org/abs/2605.21497> ・ DeepRed（VM 靶机）<https://arxiv.org/abs/2604.19354> ・ STRIATUM-CTF <https://arxiv.org/abs/2603.22577>
+- LLM 渗透测试综述（2026-07）<https://arxiv.org/abs/2607.02605> ・《LLM 对 CTF 公平性冲击》<https://arxiv.org/abs/2607.25425>
+- 抗注入：LivePI <https://arxiv.org/abs/2605.17986> ・ Gray Swan IPI Arena 复盘 <https://www.grayswan.ai/blog/>
+- Cybench 2026 榜单参考：<https://llm-stats.com/benchmarks/cybench> ・ HackTheBox AI vs Human <https://www.hackthebox.com/blog/ai-vs-human-ctf-hack-the-box-results>
+- 仓库：verialabs/ctf-agent、aliasrobotics/CAI（已归档）
