@@ -498,6 +498,24 @@ def _stage_attachments(
     return staged
 
 
+def _detect_qa_only(platform_url: str, token: str, challenge_id: str) -> bool:
+    """Read is_qa_only from the raw challenge (the domain model drops it). Dev
+    helper to pick run_mode; best-effort, never raises."""
+    import httpx
+
+    base = platform_url.rstrip("/") + "/api/v1"
+    try:
+        with httpx.Client(
+            timeout=30, headers={"Authorization": f"Bearer {token}"}
+        ) as c:
+            r = c.get(f"{base}/challenges/{challenge_id}")
+            if r.status_code == 200:
+                return bool(r.json().get("is_qa_only"))
+    except Exception:
+        pass
+    return False
+
+
 async def _run_integration(
     result_path: str, t0: float, competition_override: str | None, secret_env_path: str
 ) -> tuple[RunResult, dict[str, Any]]:
@@ -602,7 +620,7 @@ async def _run_solve(
     from agent.briefing import load_task
     from agent.config import Settings
     from agent.domain.coordinator import Coordinator
-    from agent.domain.state import Task
+    from agent.domain.state import RunMode, Task
 
     _load_secret_env(secret_env_path)
     settings = Settings.from_env()
@@ -639,6 +657,7 @@ async def _run_solve(
     # without touching any frozen contract — it's dev plumbing in the harness.
     solve_notes: list[str] = []
     work_root: str | None = None
+    qa_only = False
     if challenge_id:
         import tempfile
 
@@ -646,8 +665,16 @@ async def _run_solve(
         staged = _stage_attachments(
             settings.platform_url, settings.token, challenge_id, work_root
         )
+        # The platform tells image-mode the run_mode via task.json; dev must
+        # mirror it. A qa_only challenge has no instance, so run it in QA mode —
+        # else the coordinator tries to start an instance and 4xx's. The domain
+        # Challenge model doesn't carry is_qa_only, so read it from the raw API.
+        qa_only = _detect_qa_only(
+            settings.platform_url, settings.token, challenge_id
+        )
         solve_notes.append(
-            f"targeted solve of {challenge_id}; staged attachments: {staged or 'none'}"
+            f"targeted solve of {challenge_id}; staged attachments: "
+            f"{staged or 'none'}; qa_only={qa_only}"
         )
 
     execution = CountingExecution(SubprocessAdapter(root=work_root))
@@ -662,6 +689,7 @@ async def _run_solve(
         if challenge_id:
             ch_obj = await platform.get_challenge(challenge_id)
             task = Task(
+                run_mode=RunMode.QA if qa_only else RunMode.INSTANCE,
                 challenge=ch_obj, competition_id=cid, max_turns=max_turns,
                 result_path=result_path, stdout_fallback=True,
             )
