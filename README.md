@@ -12,17 +12,36 @@ ctfy-agent 是一个**容器化的自主解题智能体**：比赛期间无人�
 
 这几条边就是几个端口：平台（platform）、模型（llm）、执行（execution）、**结果写出（result / ResultSink）**，外加一个时钟（clock，把重试 / 退避的时间依赖抽出来便于测试）。domain 的核心是**协调器（Coordinator）**、**竞速蜂群（Swarm）**、**解题器（Solver）** 三件套。
 
-```
-                组合根 wiring 在启动时按环境装配
-入口 entrypoints ─▶ domain（纯逻辑：Coordinator / Swarm / Solver）
-                         │ 只依赖
-                         ▼
-                    ports（冻结契约 Protocol：platform / llm / execution / result / clock）
-                         ▲ 被实现
-                    adapters（可换，承担全部 I/O）
+```mermaid
+flowchart TB
+    entry(["运行入口<br/>image_main · connected_main"])
+    wiring{{"组合根 · wiring.py<br/>按运行环境装配"}}
+
+    subgraph domain["领域层 · domain/ · 纯控制逻辑"]
+        direction LR
+        coordinator["Coordinator<br/>调度与预算"]
+        swarm["Swarm<br/>并行竞速"]
+        solver["Solver<br/>ReAct 求解循环"]
+        coordinator --> swarm --> solver
+    end
+
+    ports["冻结契约 · ports/<br/>PlatformPort · LLMPort · ExecutionPort<br/>ResultSink · ClockPort"]
+    adapters[["I/O 适配器 · adapters/<br/>CTFY REST · Gateway · Subprocess<br/>CtfyResultSink · RealClock"]]
+
+    entry -->|驱动| domain
+    entry -->|请求装配| wiring
+    domain -->|仅依赖契约| ports
+    adapters -->|实现契约| ports
+    wiring -.->|创建| adapters
+    wiring -.->|注入端口实现| domain
+
+    classDef contract stroke-dasharray: 5 3;
+    class ports contract;
 ```
 
-**铁律**：依赖只能由外向内 —— `adapters → ports → domain`，**domain 不 import 任何 adapter**。这条边界由 import-linter（`lint-imports`）在全检里强制，违规的 import 会直接让全检失败。
+图中实线表示驱动或契约关系，虚线表示装配与注入；适配器仅列出当前正式路径使用的实现。
+
+**铁律**：`domain/` 只依赖 `ports/` 的 I/O 契约，**不 import 任何 adapter**；具体适配器由 `wiring.py` 装配后注入。这条边界由 import-linter（`lint-imports`）在全检里强制，违规的 import 会直接让全检失败。
 
 想并行开发？认领一个端口 + 它的适配器即可独立推进：适配器矩阵见 [docs/adr/0001-agent-architecture.md](docs/adr/0001-agent-architecture.md) §3.4，新增适配器的步骤见 [AGENTS.md](AGENTS.md) §4。
 
@@ -67,6 +86,13 @@ python -m agent.entrypoints.connected_main --challenge <id>   # 不带 --challen
 **空跑自检（dry-run）**：把 `.env` 里的 `CTFY_EVAL_DRY_RUN` 设为 `1`（bash 下也可 `CTFY_EVAL_DRY_RUN=1 python -m agent.entrypoints.image_main`）。此时镜像入口只写一份最小合法的 `result.json`、不做任何模型调用，用来验证容器能正常启动并产出结果。
 
 此外还有本地 CLI `ctfy-agent`（`agent.entrypoints.cli_main`），目前是个轻量占位入口（支持 `--version` 等），会把你指向连线模式。
+
+### 任务、实例与预算
+
+- `task.json` 按平台标准读取顶层 `questions` / `gated_questions`；缺少问题时尝试拉取题目详情，不把空题集当作已完成。只有已知问题全部答对且没有待解锁问题时，才报告 `fully_solved=true`；每次 CORRECT 判定后重新拉取问题以继续解锁。
+- `instance` 模式先启动实例，按平台返回的 `poll_after_s` 等待就绪，再把 host / port / TLS / SNI 连接数据交给 solver；比赛暂停时由适配器按平台等待时间重试启动，真正不可用的实例不调用模型。`qa` 模式不启动实例，普通选项答案走 QA 提交接口，不要求 flag 外形。
+- `max_turns` 是**整次运行**的模型调用轮次上限，所有题目和竞速 lane 共享扣减，发起调用前预占，失败调用也计入；CLI harness 每次启动计一轮。任务中的 `max_turns: null` 表示不设轮次上限，只有缺少该键时才继承环境配置。
+- `limits.max_tokens`（缺省用 `CTFY_EVAL_MAX_TOKENS`）按模型网关返回的实际用量在整次运行内累计。它是软上限：单次响应或已在途的并发调用可能越过阈值，但之后不再发起新调用；CLI harness 内部的 token 用量当前不可见。
 
 ## 目录速览
 

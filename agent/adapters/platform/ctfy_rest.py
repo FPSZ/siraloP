@@ -195,14 +195,14 @@ class CtfyRestAdapter:
         body: dict[str, Any] = {"challenge_id": cid}
         if self._competition_id:
             body["competition_id"] = self._competition_id
-        resp = await self._request("POST", "/instances", json=body)
-        # A 403 competition_paused is possible here (CTFY-0001 §4). The frozen
-        # Instance has no PAUSED phase, so a pause is surfaced as a non-READY
-        # (STOPPED) instance whose poll_after_s carries the platform's wait —
-        # the caller polls and sees it is not ready, instead of crashing.
-        paused = self._paused_instance(resp, cid)
-        if paused is not None:
-            return paused
+        # A paused competition is a wait inside this I/O adapter, not a
+        # fabricated terminal instance. Keep the frozen Instance status truthful.
+        while True:
+            resp = await self._request("POST", "/instances", json=body)
+            pause_delay = self._instance_pause_delay(resp)
+            if pause_delay is None:
+                break
+            await self._clock.sleep(pause_delay)
         self._checked(resp, "POST /instances")
         d = self._unwrap(self._json_dict(resp), "data", "instance", "result")
         inst = self._instance_from_detail(d, fallback_id=cid, resp=resp)
@@ -488,15 +488,8 @@ class CtfyRestAdapter:
             parts.append(f"retry_after_s={ra}")
         return "; ".join(str(p) for p in parts)
 
-    def _paused_instance(self, resp: httpx.Response, cid: str) -> Instance | None:
-        """A paused start (CTFY-0001 §4) as a non-READY Instance, or None.
-
-        Returns ``None`` for a success or for an ordinary (non-paused) error, so
-        the caller still runs ``_checked`` and raises on a real auth/other 4xx.
-        For ``competition_paused`` (403, or 409/423) it returns a STOPPED
-        instance whose ``poll_after_s`` carries the platform's ``retry_after_s``
-        — the session ended and resumes later, so the caller waits, not crashes.
-        """
+    def _instance_pause_delay(self, resp: httpx.Response) -> float | None:
+        """Return the platform's wait for a paused start, otherwise None."""
         if resp.is_success:
             return None
         data = self._json_dict(resp)
@@ -509,6 +502,8 @@ class CtfyRestAdapter:
             for k in ("code", "status", "result", "state", "outcome")
             if isinstance(merged.get(k), str)
         }
+        if "competition_not_in_session" in signals:
+            return None  # No future session remains; do not wait forever.
         is_paused = (
             resp.status_code in (409, 423)
             or bool(signals & _PAUSED)
@@ -521,11 +516,7 @@ class CtfyRestAdapter:
         )
         if retry is None:
             retry = self._retry_after(resp)
-        return Instance(
-            id=self._as_str(self._pick(merged, "id", "instance_id", "iid", default=cid)),
-            status=InstanceStatus.STOPPED,
-            poll_after_s=retry if retry is not None else 2.0,
-        )
+        return retry if retry is not None else 2.0
 
     @staticmethod
     def _attempts_left(d: dict[str, Any]) -> int | None:

@@ -304,16 +304,64 @@ async def test_start_instance_benchmark_vpn_service_is_raw_tcp():
     assert inst.tls_sni is False  # raw tcp over the VPN, not TLS+SNI
 
 
-async def test_start_instance_competition_paused_is_not_ready():
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json=PAUSED_BODY)
+@pytest.mark.parametrize("status", [403, 409, 423])
+async def test_start_instance_waits_for_paused_session_then_returns_ready(status):
+    calls = 0
 
-    inst = await _adapter(handler).start_instance("SAMPLE-001")
-    # A pause must not crash; it surfaces as a non-READY instance whose
-    # poll_after_s carries the platform's wait.
-    assert inst.status is InstanceStatus.STOPPED
-    assert inst.ready is False
-    assert inst.poll_after_s == 2057694
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(status, json=PAUSED_BODY)
+        return httpx.Response(
+            200, json={"id": "i1", "status": "ready", "host": "chal.local", "port": 443}
+        )
+
+    clock = FakeClock()
+    inst = await _adapter(handler, clock).start_instance("SAMPLE-001")
+
+    assert inst.ready
+    assert inst.host == "chal.local"
+    assert calls == 2
+    assert clock.slept == [2057694]
+
+
+async def test_start_instance_repeated_pauses_honor_header_and_body_waits():
+    responses = iter([
+        httpx.Response(409, headers={"Retry-After": "3"}, json={}),
+        httpx.Response(
+            403, json={"code": "competition_paused", "detail": {"retry_after_s": 5}}
+        ),
+        httpx.Response(
+            200, json={"id": "i1", "status": "ready", "host": "chal.local", "port": 443}
+        ),
+    ])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    clock = FakeClock()
+    inst = await _adapter(handler, clock).start_instance("SAMPLE-001")
+
+    assert inst.ready
+    assert clock.slept == [3, 5]
+
+
+async def test_start_instance_does_not_wait_after_final_session():
+    calls = 0
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            403, json={"code": "competition_not_in_session", "detail": {"retry_after_s": 5}}
+        )
+
+    clock = FakeClock()
+    with pytest.raises(RuntimeError):
+        await _adapter(handler, clock).start_instance("SAMPLE-001")
+    assert calls == 1
+    assert clock.slept == []
 
 
 # --- submit: every VerdictStatus --------------------------------------------
