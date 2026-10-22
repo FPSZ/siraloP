@@ -303,10 +303,14 @@ class CtfyRestAdapter:
         return self._grade(resp)
 
     async def submit_qa(self, cid: str, qid: str, answer: str) -> Verdict:
-        resp = await self._request(
-            "POST", "/qa/submissions",
-            json={"challenge_id": cid, "question_id": qid, "answer": answer},
-        )
+        # QA grading needs competition_id in the body (the platform 422s without
+        # it: "competition_id: Field required"), verified against the live API.
+        body: dict[str, Any] = {
+            "challenge_id": cid, "question_id": qid, "answer": answer,
+        }
+        if self._competition_id:
+            body["competition_id"] = self._competition_id
+        resp = await self._request("POST", "/qa/submissions", json=body)
         return self._grade(resp)
 
     async def scoreboard(self, competition_id: str) -> Scoreboard:

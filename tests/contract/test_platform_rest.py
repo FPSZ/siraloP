@@ -447,8 +447,25 @@ async def test_submit_qa_routes_to_qa_endpoint():
 
     v = await _adapter(handler).submit_qa("QA-1", "q1", "A")
     assert seen["path"] == "/api/v1/qa/submissions"
-    assert seen["body"] == {"challenge_id": "QA-1", "question_id": "q1", "answer": "A"}
+    # QA grading 422s without competition_id — it MUST ride in the body.
+    assert seen["body"] == {
+        "challenge_id": "QA-1", "question_id": "q1", "answer": "A",
+        "competition_id": COMPETITION_ID,
+    }
     assert v.status is VerdictStatus.CORRECT
+
+
+async def test_submit_qa_grades_real_response_shape():
+    # The live QA verdict shape: {correct, attempts_remaining, ...} (no "status").
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"id": "s1", "correct": False, "attempts_remaining": 9,
+                       "challenge_fully_solved": False}
+        )
+
+    v = await _adapter(handler).submit_qa("SAMPLE-005", "flag", "nope")
+    assert v.status is VerdictStatus.WRONG
+    assert v.attempts_left == 9
 
 
 async def test_submit_qa_403_competition_paused_maps_to_paused():
