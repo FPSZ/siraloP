@@ -205,6 +205,11 @@ class GatewayAdapter:
     def _parse_anthropic(self, data: dict[str, Any]) -> LLMResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        # Only `text` and `tool_use` carry answer content. Every other block type
+        # is intentionally ignored — notably `thinking` (extended-thinking, and
+        # the reasoning blocks GLM-4.6 returns on the bigmodel anthropic-compatible
+        # endpoint), plus any future type. Skipping unknown blocks (rather than
+        # raising) is what keeps a reasoning model's turn from crashing the loop.
         for block in data.get("content") or []:
             btype = block.get("type")
             if btype == "text":

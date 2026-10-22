@@ -90,7 +90,7 @@ python -m agent.entrypoints.connected_main --challenge <id>   # 不带 --challen
 ### 任务、实例与预算
 
 - `task.json` 按平台标准读取顶层 `questions` / `gated_questions`；缺少问题时尝试拉取题目详情，不把空题集当作已完成。只有已知问题全部答对且没有待解锁问题时，才报告 `fully_solved=true`；每次 CORRECT 判定后重新拉取问题以继续解锁。
-- `instance` 模式先启动实例，按平台返回的 `poll_after_s` 等待就绪，再把 host / port / TLS / SNI 连接数据交给 solver；实例不可用时不调用模型。`qa` 模式不启动实例，普通选项答案走 QA 提交接口，不要求 flag 外形。
+- `instance` 模式先启动实例，按平台返回的 `poll_after_s` 等待就绪，再把 host / port / TLS / SNI 连接数据交给 solver；比赛暂停时由适配器按平台等待时间重试启动，真正不可用的实例不调用模型。`qa` 模式不启动实例，普通选项答案走 QA 提交接口，不要求 flag 外形。
 - `max_turns` 是**整次运行**的模型调用轮次上限，所有题目和竞速 lane 共享扣减，发起调用前预占，失败调用也计入；CLI harness 每次启动计一轮。任务中的 `max_turns: null` 表示不设轮次上限，只有缺少该键时才继承环境配置。
 - `limits.max_tokens`（缺省用 `CTFY_EVAL_MAX_TOKENS`）按模型网关返回的实际用量在整次运行内累计。它是软上限：单次响应或已在途的并发调用可能越过阈值，但之后不再发起新调用；CLI harness 内部的 token 用量当前不可见。
 

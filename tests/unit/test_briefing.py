@@ -98,3 +98,18 @@ def test_max_turns_distinguishes_null_from_missing(tmp_path, monkeypatch, briefi
     task = load_task(settings)
 
     assert task.max_turns == expected
+
+
+def test_question_mode_from_real_api_is_preserved(tmp_path):
+    (tmp_path / "task.json").write_text(
+        json.dumps({
+            "challenge": {"id": "qa1"},
+            "questions": [{"id": "q1", "prompt": "Choose one", "mode": "single"}],
+        }),
+        encoding="utf-8",
+    )
+
+    task = load_task(Settings(work_dir=str(tmp_path)))
+
+    assert task.challenge is not None
+    assert task.challenge.unanswered()[0].fmt == "single"

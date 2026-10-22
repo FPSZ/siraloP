@@ -24,7 +24,7 @@ def _question(d: dict[str, Any]) -> Question:
         answered=bool(d.get("answered", False)),
         locked=bool(d.get("locked", False)),
         choices=list(d.get("choices", []) or []),
-        fmt=str(d.get("format", d.get("fmt", ""))),
+        fmt=str(d.get("format") or d.get("fmt") or d.get("mode") or ""),
     )
 
 
