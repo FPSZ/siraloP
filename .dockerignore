@@ -1,22 +1,25 @@
-# Keep the submission image lean and secret-free. Only agent/ + pyproject are
-# needed at build time (see Dockerfile).
-.git/
-.github/
-.venv/
-venv/
-__pycache__/
-**/__pycache__/
-*.pyc
-*.log
-.env
-.env.*
-
-# not needed in the image
-tests/
-docs/
-tools/
+# Keep the build context small AND keep secrets/local junk off the Docker daemon.
+# The image only COPYs pyproject.toml + agent/, but the whole context is sent to
+# the daemon unless excluded here.
+.git
+.github
+external-agents/
+regression/
 scratch/
 tmp/
-
-# external agent source — research only, never ship or upload
-external-agents/
+docs/secret.env
+*.env
+!.env.example
+*.secret
+secrets/
+**/__pycache__/
+**/*.pyc
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+result.json
+.result-*.tmp
+chal-*/
+Dockerfile*
+.dockerignore
