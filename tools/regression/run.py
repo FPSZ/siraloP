@@ -294,6 +294,11 @@ class CountingExecution:
         self.workspaces += 1
         return await self._inner.new_workspace(challenge_id)
 
+    async def aclose(self) -> None:
+        close = getattr(self._inner, "aclose", None)
+        if close is not None:
+            await close()
+
 
 # --- 真实 HTTP 层计数（仅 integration/solve 注入到 httpx 客户端） ----------
 def _make_counting_transport() -> Any:
@@ -461,12 +466,12 @@ def _load_secret_env(path: str) -> None:
 def _stage_attachments(
     platform_url: str, token: str, challenge_id: str, work_root: str
 ) -> list[str]:
-    """Download a challenge's attachments into <work_root>/<challenge_id>/ so the
-    agent's per-challenge workspace already holds them. Dev-only (mirrors the
-    platform's image-mode /ctfy/work staging); best-effort, never raises."""
+    """Download a challenge's attachments into the adapter ROOT so new_workspace()
+    seeds each fresh per-lane workspace with them. Dev-only (mirrors the platform's
+    image-mode /ctfy/work staging); best-effort, never raises."""
     import httpx
 
-    ws = os.path.join(work_root, challenge_id)
+    ws = work_root
     os.makedirs(ws, exist_ok=True)
     base = platform_url.rstrip("/") + "/api/v1"
     headers = {"Authorization": f"Bearer {token}"}
@@ -707,6 +712,10 @@ async def _run_solve(
         result = RunResult(stop_reason=f"error: {type(e).__name__}")
     finally:
         sink.write(result)
+        try:
+            await execution.aclose()  # tear down persistent shell sessions
+        except Exception:
+            pass
         for c in (plat_client, gw_client):
             try:
                 await c.aclose()

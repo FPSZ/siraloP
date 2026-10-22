@@ -68,6 +68,23 @@ class SubprocessAdapter:
         # first ``await`` (Python 3.10+), so construction outside a loop is fine.
         self._sem = asyncio.Semaphore(max_concurrency)
         self._output_cap = output_cap
+        # Persistent shell sessions, one per working directory. The agent drives a
+        # STATEFUL shell: `cd`, env vars and shell functions persist across execute
+        # calls — matching how a terminal actually behaves. A stateless fresh shell
+        # per command makes multi-step work (extract an archive, THEN read a file
+        # inside it) fall apart, which is exactly how the agent used to get lost.
+        # Each racing lane gets its own workspace+session (see new_workspace), so
+        # lanes never share shell state.
+        self._sessions: dict[str, _ShellSession] = {}
+        self._ws_counter = 0
+        self._closed = False
+        # Session shell: the Windows POSIX shell when detected, else bash, else sh.
+        # Invoked non-interactively, reading commands from stdin.
+        shell = self._posix_shell or shutil.which("bash") or "/bin/sh"
+        argv = [shell]
+        if os.path.basename(shell).lower().startswith("bash"):
+            argv += ["--norc", "--noprofile"]
+        self._session_argv = argv
 
     # -- ExecutionPort ----------------------------------------------------
 
@@ -108,12 +125,27 @@ class SubprocessAdapter:
         await loop.run_in_executor(None, _write)
 
     async def new_workspace(self, challenge_id: str) -> str:
-        """Return a fresh, absolute, per-challenge working directory path."""
+        """A FRESH, unique, absolute working directory for one solve attempt.
+
+        Unique per call so racing lanes never share persistent-shell state. Seeded
+        with the top-level files staged directly under the adapter root (e.g. the
+        challenge's attachments), so every attempt starts from the same materials.
+        """
+        n = self._ws_counter
+        self._ws_counter += 1
+        safe = os.path.basename(str(challenge_id)) or "chal"
         loop = asyncio.get_running_loop()
 
         def _mk() -> str:
-            d = os.path.abspath(os.path.join(self._root, challenge_id))
+            d = os.path.abspath(os.path.join(self._root, f"{safe}-ws{n}"))
             os.makedirs(d, exist_ok=True)
+            try:  # seed attachments (top-level files staged under the root)
+                for name in os.listdir(self._root):
+                    src = os.path.join(self._root, name)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, os.path.join(d, name))
+            except OSError:
+                pass
             return d
 
         return await loop.run_in_executor(None, _mk)
@@ -123,55 +155,32 @@ class SubprocessAdapter:
     async def _run_inner(
         self, cmd: str, timeout_s: int, workdir: str | None
     ) -> ExecResult:
+        if self._closed:
+            return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=False)
         loop = asyncio.get_running_loop()
         cwd = os.path.abspath(workdir) if workdir else self._root
         # Defensive: a missing cwd would make spawning raise; create it so run()
         # keeps its "don't raise on ordinary failures" contract.
         await loop.run_in_executor(None, lambda: os.makedirs(cwd, exist_ok=True))
-
-        if self._posix_shell:
-            # Explicit `<shell> -c "<cmd>"` so Windows dev runs the agent's POSIX
-            # command line through bash/sh instead of cmd.exe (prod parity).
-            proc = await asyncio.create_subprocess_exec(
-                self._posix_shell, "-c", cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                **self._spawn_kwargs(),
+        session = self._sessions.get(cwd)
+        if session is None:
+            session = _ShellSession(
+                self._session_argv, cwd, self._spawn_kwargs(), kill=self._kill_tree
             )
-        else:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                **self._spawn_kwargs(),
-            )
+            self._sessions[cwd] = session
+        return await session.run(cmd, timeout_s, output_cap=self._output_cap)
 
-        timed_out = False
-        try:
-            # communicate() buffers the full output; the cap is applied after.
-            # Bounded by timeout_s, so output stays practically finite.
-            raw_out, raw_err = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_s
-            )
-        except TimeoutError:
-            timed_out = True
-            await self._kill_tree(proc)
-            raw_out, raw_err = await self._reap(proc)
-
-        stdout = raw_out.decode("utf-8", errors="replace") if raw_out else ""
-        stderr = raw_err.decode("utf-8", errors="replace") if raw_err else ""
-        stdout, stderr, truncated = self._cap_combined(stdout, stderr, self._output_cap)
-
-        exit_code = proc.returncode if proc.returncode is not None else -1
-        return ExecResult(
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=exit_code,
-            timed_out=timed_out,
-            truncated=truncated,
-        )
+    async def aclose(self) -> None:
+        """Terminate every persistent shell session (idempotent). A long-lived
+        adapter (dev harness) should call this; a one-shot process exit also tears
+        the child shells down via the kill flags."""
+        self._closed = True
+        sessions, self._sessions = self._sessions, {}
+        for s in sessions.values():
+            try:
+                await s.aclose()
+            except Exception:
+                pass
 
     @staticmethod
     def _spawn_kwargs() -> dict[str, Any]:
@@ -260,3 +269,122 @@ class SubprocessAdapter:
         if len(stderr) <= half:
             return stdout[: cap - len(stderr)], stderr, True
         return stdout[:half], stderr[: cap - half], True
+
+
+class _ShellSession:
+    """A persistent, single shell process for one working directory.
+
+    Commands run strictly in order (serialized by a lock); the shell keeps its
+    state — current directory, environment, shell functions — BETWEEN calls, so
+    the agent can `cd` into an extracted archive in one step and read a file in
+    it the next. stdout+stderr are merged (one ordered stream the agent reads).
+
+    Protocol: each command is written to the shell's stdin, followed by a line
+    that prints a unique random marker plus ``$?``. We read the merged stream up
+    to that marker — everything before it is the command's output; the digits
+    after it are the exit code. A command that hangs past ``timeout_s`` has its
+    whole process tree killed and the session dropped (state is lost, which is
+    acceptable for the exceptional timeout path); the next call starts fresh.
+    """
+
+    def __init__(
+        self,
+        argv: list[str],
+        cwd: str,
+        spawn_kwargs: dict[str, Any],
+        *,
+        kill: Any,
+    ) -> None:
+        self._argv = argv
+        self._cwd = cwd
+        self._spawn_kwargs = spawn_kwargs
+        self._kill = kill  # adapter._kill_tree(proc) — kills the tree, cross-platform
+        self._proc: asyncio.subprocess.Process | None = None
+        self._lock = asyncio.Lock()
+        self._marker = "__CTFY_" + os.urandom(8).hex() + "__"
+
+    async def _ensure(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            return
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=self._cwd,
+            **self._spawn_kwargs,
+        )
+
+    async def run(self, cmd: str, timeout_s: int, *, output_cap: int) -> ExecResult:
+        async with self._lock:
+            try:
+                await self._ensure()
+            except Exception:
+                return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=False)
+            proc = self._proc
+            assert proc is not None and proc.stdin is not None
+            payload = (
+                cmd + "\n" + f"printf '%s%d\\n' '{self._marker}' \"$?\"\n"
+            ).encode("utf-8", "replace")
+            try:
+                proc.stdin.write(payload)
+                await proc.stdin.drain()
+            except Exception:
+                await self._discard(proc)
+                return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=False)
+            try:
+                out, code, died = await asyncio.wait_for(
+                    self._read_until(proc), timeout_s
+                )
+            except TimeoutError:
+                await self._discard(proc)  # command hung — drop the session
+                return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+            if died:
+                await self._discard(proc)
+            truncated = len(out) > output_cap
+            if truncated:
+                out = out[:output_cap]
+            return ExecResult(
+                stdout=out, stderr="", exit_code=code,
+                timed_out=False, truncated=truncated,
+            )
+
+    async def _read_until(self, proc: asyncio.subprocess.Process) -> tuple[str, int, bool]:
+        """Read the merged stream until the marker; return (output, exit_code, died)."""
+        assert proc.stdout is not None
+        mbytes = self._marker.encode()
+        buf = bytearray()
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:  # EOF: the shell exited (e.g. the command ran `exit`)
+                return buf.decode("utf-8", "replace"), -1, True
+            buf += chunk
+            idx = buf.find(mbytes)
+            if idx == -1:
+                continue
+            nl = buf.find(b"\n", idx)
+            if nl == -1:
+                continue  # marker seen but need the full exit-code line
+            try:
+                code = int(buf[idx + len(mbytes):nl])
+            except ValueError:
+                code = -1
+            return bytes(buf[:idx]).decode("utf-8", "replace"), code, False
+
+    async def _discard(self, proc: asyncio.subprocess.Process) -> None:
+        self._proc = None
+        try:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            await self._kill(proc)
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            proc, self._proc = self._proc, None
+            if proc is not None and proc.returncode is None:
+                await self._discard(proc)
