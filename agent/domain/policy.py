@@ -27,6 +27,11 @@ def is_trusted_instruction(_source: str) -> bool:
     return False
 
 
-def should_stop(budget: Budget, stalled_turns: int, *, stall_limit: int = 6) -> bool:
-    """Stop-loss: out of budget, or no new evidence for stall_limit turns."""
+def should_stop(budget: Budget, stalled_turns: int, *, stall_limit: int = 12) -> bool:
+    """Stop-loss: out of budget, or no NEW EVIDENCE for stall_limit turns.
+
+    stall_limit counts turns that surfaced nothing new (see solver's novelty
+    check) — multi-step work (unzip a layer, read a file) is progress, not a
+    stall. Raised from 6: a single deep lane needs room to peel many layers.
+    """
     return budget.exhausted() or stalled_turns >= stall_limit

@@ -30,9 +30,12 @@ from agent.ports.result import ResultSink
 
 # ROI difficulty ordering: cheapest points first (ADR-0002 §7).
 _DIFFICULTY_RANK = {"easy": 0, "medium": 1, "": 2, "hard": 3}
-# Race width by difficulty (easy/medium race, hard goes single-lane in the Swarm).
-_LANES_BY_DIFFICULTY = {"easy": 3, "medium": 2, "hard": 1}
-_DEFAULT_LANES = 2
+# Single deep lane per challenge. Racing CLONES (same model + same prompt, see
+# _models) only split the shared budget and dilute each chain's depth — the
+# opposite of what a 5-layer puzzle needs (docs/testing/工作流诊断.md). Keep width
+# at 1 until lanes are GENUINELY diverse (distinct models / strategies).
+_LANES_BY_DIFFICULTY = {"easy": 1, "medium": 1, "hard": 1}
+_DEFAULT_LANES = 1
 
 
 class Coordinator:

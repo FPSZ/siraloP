@@ -73,6 +73,22 @@ def _find_candidates(text: str) -> list[str]:
     return seen
 
 
+def _extract_plan(text: str) -> list[str]:
+    """Pull the model's own todo-plan lines (`[ ]`/`[x] ...`) to carry forward.
+
+    The loop used to keep a static placeholder plan and never fed the model's
+    updated plan back, so every turn's context looked identical and the model
+    kept re-reconning instead of advancing. Carrying its plan forward is the
+    cheap half of giving the loop a memory.
+    """
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s[:3].lower() in ("[ ]", "[x]"):
+            out.append(s)
+    return out[:8]
+
+
 def _is_qa(question: Question, run_mode: RunMode) -> bool:
     return (
         run_mode is RunMode.QA
@@ -275,6 +291,7 @@ class ReActSolver:
         invalid_streak = 0
         stalled = 0
         last_signature = ""
+        seen_obs: set[str] = set()  # observation fingerprints: novelty = progress
 
         while True:
             if not challenge.unanswered():
@@ -289,13 +306,20 @@ class ReActSolver:
             self.budget.charge(turns=1)
             self.turns += 1
             resp = await self.llm.complete(
-                messages, model=self.model, tools=self._tools(challenge)
+                messages, model=self.model, effort="high", tools=self._tools(challenge)
             )
             self.budget.charge(
                 input_tokens=resp.input_tokens, output_tokens=resp.output_tokens
             )
             self.input_tokens += resp.input_tokens
             self.output_tokens += resp.output_tokens
+
+            # Carry the model's own todo plan forward (it was a static placeholder
+            # before — the loop never fed an updated plan back, a root cause of the
+            # model re-reconning from scratch each turn).
+            new_plan = _extract_plan(resp.text)
+            if new_plan:
+                plan = new_plan
 
             call = resp.tool_calls[0] if resp.tool_calls else None
 
@@ -334,10 +358,12 @@ class ReActSolver:
                 continue
 
             # execute
-            obs = await self._run_execute(call, workdir)
+            obs, raw_stdout = await self._run_execute(call, workdir)
             recent_obs = obs
 
-            candidates = _find_candidates(obs)
+            # Scan the FULL stdout for candidate flags, not the truncated view —
+            # a flag printed before the tail cutoff must still be submittable.
+            candidates = _find_candidates(raw_stdout or obs)
             progressed = False
             for cand in candidates:
                 self.bus.publish(
@@ -355,11 +381,22 @@ class ReActSolver:
                     if _is_complete(challenge):
                         return self._final_status(challenge, RunStatus.SOLVED)
 
+            # Stall accounting by NOVELTY, not flag-shape: peeling a new archive
+            # layer or reading new file contents IS progress. Only an exact repeat
+            # (same command + same output) or a turn that surfaced nothing new
+            # counts against the stall limit.
+            obs_fp = obs[:400]
+            novel = obs_fp not in seen_obs
+            seen_obs.add(obs_fp)
             signature = f"{call.name}:{call.arguments.get('cmd', '')}|{obs[:120]}"
-            if not progressed and signature == last_signature:
-                stalled += 1
+            if progressed:
+                stalled = 0
+            elif signature == last_signature:
+                stalled += 1  # exact repeat — a doom-loop
+            elif novel:
+                pass  # new evidence this turn — not a stall
             else:
-                stalled = 0 if progressed else stalled + (0 if candidates else 1)
+                stalled += 1  # ran a command but learned nothing new
             last_signature = signature
 
         # unreachable
@@ -384,7 +421,14 @@ class ReActSolver:
             return True, ""
         return False, f"unknown tool {call.name!r}"
 
-    async def _run_execute(self, call: ToolCall, workdir: str | None) -> str:
+    async def _run_execute(
+        self, call: ToolCall, workdir: str | None
+    ) -> tuple[str, str]:
+        """Run the model's command; return (observation_for_model, raw_stdout).
+
+        The observation is short/structured (with cwd) for the context window; the
+        raw stdout is returned separately so flag-scanning sees the FULL output.
+        """
         cmd = str(call.arguments.get("cmd", ""))
         timeout_s = int(call.arguments.get("timeout_s", 60))
         try:
@@ -392,18 +436,39 @@ class ReActSolver:
                 cmd, timeout_s=timeout_s, workdir=workdir
             )
         except Exception as e:  # a broken sandbox — surface, keep the lane alive
-            return f"execution error: {e!r}"
-        return self._parse_observation(res)
+            return f"execution error: {e!r}", ""
+        cwd = await self._current_cwd(workdir)
+        return self._parse_observation(res, cwd), res.stdout
+
+    async def _current_cwd(self, workdir: str | None) -> str:
+        """Best-effort cwd of the PERSISTENT shell session (cheap extra `pwd`).
+
+        The shell keeps cwd across calls, so a `cd` in a prior command moved us;
+        surfacing it each turn lets the model self-correct relative-path errors
+        (the `cannot find archive.zip` failure mode).
+        """
+        try:
+            r = await self.execution.run("pwd", timeout_s=5, workdir=workdir)
+        except Exception:
+            return ""
+        out = r.stdout.strip().splitlines()
+        return out[-1] if out else ""
 
     @staticmethod
-    def _parse_observation(res: ExecResult) -> str:
-        """Fold an ExecResult into a short structured observation (no raw dump)."""
+    def _parse_observation(res: ExecResult, cwd: str = "") -> str:
+        """Fold an ExecResult into a short structured observation (no raw dump).
+
+        The header carries the current cwd so the model tracks the persistent
+        shell's position and uses correct (ideally absolute) paths.
+        """
         flags = []
         if res.timed_out:
             flags.append("TIMED_OUT")
         if res.truncated:
             flags.append("TRUNCATED")
         head = f"exit={res.exit_code}" + (f" [{','.join(flags)}]" if flags else "")
+        if cwd:
+            head += f" cwd={cwd}"
         out = _tail(res.stdout)
         err = _tail(res.stderr)
         parts = [head]

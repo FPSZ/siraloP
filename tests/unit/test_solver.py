@@ -79,8 +79,13 @@ def test_untrusted_output_is_never_an_instruction():
 
 
 def test_policy_should_stop_on_stall():
-    assert policy.should_stop(Budget(), 6) is True
+    # stall_limit default is 12 (raised from 6 so a single deep lane can peel many
+    # archive layers before giving up; see docs/testing/工作流诊断.md).
+    assert policy.should_stop(Budget(), 12) is True
+    assert policy.should_stop(Budget(), 11) is False
     assert policy.should_stop(Budget(), 0) is False
+    # an explicit stall_limit is still honored
+    assert policy.should_stop(Budget(), 3, stall_limit=3) is True
 
 
 class RoutedPlatform(FakePlatform):
