@@ -206,6 +206,7 @@ class CountingLLM:
         self.output_tokens = 0
         self.stop_reasons: list[str] = []
         self.exceptions: list[str] = []
+        self.actions: list[str] = []  # per turn: which tool the model called + preview
 
     async def complete(
         self,
@@ -230,6 +231,17 @@ class CountingLLM:
         self.output_tokens += getattr(resp, "output_tokens", 0) or 0
         if getattr(resp, "stop_reason", ""):
             self.stop_reasons.append(resp.stop_reason)
+        calls = getattr(resp, "tool_calls", None) or []
+        if calls:
+            previews = []
+            for tc in calls:
+                args = getattr(tc, "arguments", {}) or {}
+                arg = args.get("cmd") or args.get("answer") or args.get("flag") or ""
+                previews.append(f"{getattr(tc, 'name', '?')}({str(arg)[:120]})")
+            self.actions.append(" ; ".join(previews))
+        else:
+            text = (getattr(resp, "text", "") or "").strip().replace("\n", " ")
+            self.actions.append(f"(no tool) {text[:120]}")
         return resp
 
     async def aclose(self) -> None:
@@ -248,6 +260,7 @@ class CountingExecution:
         self.timeouts = 0
         self.workspaces = 0
         self.exceptions: list[str] = []
+        self.transcript: list[dict[str, Any]] = []  # cmd + exit + short output tail
 
     async def run(self, cmd: str, *, timeout_s: int = 60, workdir: str | None = None) -> Any:
         start = time.perf_counter()
@@ -257,10 +270,18 @@ class CountingExecution:
         except Exception as e:  # noqa: BLE001
             self.exceptions.append(type(e).__name__)
             self.durations.append(time.perf_counter() - start)
+            self.transcript.append({"cmd": cmd[:300], "error": type(e).__name__})
             raise
         self.durations.append(time.perf_counter() - start)
         if getattr(res, "timed_out", False):
             self.timeouts += 1
+        tail = ((getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")).strip()
+        self.transcript.append({
+            "cmd": cmd[:300],
+            "exit": getattr(res, "exit_code", None),
+            "timed_out": getattr(res, "timed_out", False),
+            "tail": tail[-240:],
+        })
         return res
 
     async def read_file(self, path: str) -> bytes:
@@ -437,6 +458,46 @@ def _load_secret_env(path: str) -> None:
                 os.environ[key] = val
 
 
+def _stage_attachments(
+    platform_url: str, token: str, challenge_id: str, work_root: str
+) -> list[str]:
+    """Download a challenge's attachments into <work_root>/<challenge_id>/ so the
+    agent's per-challenge workspace already holds them. Dev-only (mirrors the
+    platform's image-mode /ctfy/work staging); best-effort, never raises."""
+    import httpx
+
+    ws = os.path.join(work_root, challenge_id)
+    os.makedirs(ws, exist_ok=True)
+    base = platform_url.rstrip("/") + "/api/v1"
+    headers = {"Authorization": f"Bearer {token}"}
+    staged: list[str] = []
+    try:
+        with httpx.Client(timeout=30, headers=headers) as c:
+            lst = c.get(f"{base}/challenges/{challenge_id}/attachments")
+            names: list[str] = []
+            if lst.status_code == 200:
+                data = lst.json()
+                rows = data if isinstance(data, list) else (
+                    data.get("files") or data.get("items")
+                    or data.get("attachments") or []
+                )
+                names = [
+                    a["name"] for a in rows
+                    if isinstance(a, dict) and isinstance(a.get("name"), str)
+                ]
+            for name in names:
+                # keep the download inside the workspace (no path traversal)
+                safe = os.path.basename(name)
+                r = c.get(f"{base}/challenges/{challenge_id}/attachments/{name}")
+                if r.status_code == 200:
+                    with open(os.path.join(ws, safe), "wb") as fh:
+                        fh.write(r.content)
+                    staged.append(safe)
+    except Exception:
+        pass
+    return staged
+
+
 async def _run_integration(
     result_path: str, t0: float, competition_override: str | None, secret_env_path: str
 ) -> tuple[RunResult, dict[str, Any]]:
@@ -529,6 +590,7 @@ async def _run_integration(
 async def _run_solve(
     result_path: str, t0: float, competition_override: str | None,
     secret_env_path: str, timeout_s: float,
+    challenge_id: str | None = None, max_turns: int | None = None,
 ) -> tuple[RunResult, dict[str, Any]]:
     import httpx
 
@@ -540,6 +602,7 @@ async def _run_solve(
     from agent.briefing import load_task
     from agent.config import Settings
     from agent.domain.coordinator import Coordinator
+    from agent.domain.state import Task
 
     _load_secret_env(secret_env_path)
     settings = Settings.from_env()
@@ -568,17 +631,45 @@ async def _run_solve(
             clock=clock, client=gw_client,
         )
     )
-    execution = CountingExecution(SubprocessAdapter())
+
+    # Dev-targeted single-challenge solve: pin the run to one challenge and stage
+    # its attachments into the agent's per-challenge workspace (<root>/<cid>/),
+    # which is exactly where SubprocessAdapter.new_workspace() lands, so the
+    # agent's shell sees the files. This mirrors image-mode's /ctfy/work staging
+    # without touching any frozen contract — it's dev plumbing in the harness.
+    solve_notes: list[str] = []
+    work_root: str | None = None
+    if challenge_id:
+        import tempfile
+
+        work_root = tempfile.mkdtemp(prefix="solve-")
+        staged = _stage_attachments(
+            settings.platform_url, settings.token, challenge_id, work_root
+        )
+        solve_notes.append(
+            f"targeted solve of {challenge_id}; staged attachments: {staged or 'none'}"
+        )
+
+    execution = CountingExecution(SubprocessAdapter(root=work_root))
     sink = CtfyResultSink(result_path, stdout_fallback=True)
 
-    task = load_task(settings)
-    coord = Coordinator(
-        platform, llm, execution, sink, clock=clock, task=task, settings=settings
-    )
-
     result = RunResult(stop_reason="not_started")
-    notes: list[str] = []
+    notes: list[str] = list(solve_notes)
     try:
+        # Build the task INSIDE the guarded block so a transient platform error
+        # while fetching the target (e.g. a 503) is caught and still writes a
+        # result — it's an infra blip, not an agent failure or a runner crash.
+        if challenge_id:
+            ch_obj = await platform.get_challenge(challenge_id)
+            task = Task(
+                challenge=ch_obj, competition_id=cid, max_turns=max_turns,
+                result_path=result_path, stdout_fallback=True,
+            )
+        else:
+            task = load_task(settings)
+        coord = Coordinator(
+            platform, llm, execution, sink, clock=clock, task=task, settings=settings
+        )
         result = await asyncio.wait_for(coord.run(), timeout=timeout_s)
     except TimeoutError:
         notes.append(f"solve timed out after {timeout_s}s (bounded by --timeout)")
@@ -1045,6 +1136,140 @@ _GIT_COMMIT = "nogit"
 _GIT_DIRTY = False
 
 
+_GROUP_ORDER = [
+    "meta", "timing", "solving", "verdicts", "budget", "model", "platform",
+    "stability", "artifact",
+]
+_GROUP_TITLES = {
+    "meta": "元信息", "timing": "计时", "solving": "解题", "verdicts": "判定",
+    "budget": "预算", "model": "模型", "platform": "平台", "stability": "稳定性",
+    "artifact": "产物",
+}
+
+
+def _fmt_cell(v: Any) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, bool):
+        return "✓" if v else "✗"
+    if isinstance(v, float):
+        return f"{v:.4g}"
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+def _render_markdown(record: dict[str, Any]) -> str:
+    """Full field table (every group + per_challenge) as Markdown — the record,
+    rendered as the 表格 the field spec describes, one file per run."""
+    m = record.get("meta", {})
+    so = record.get("solving", {})
+    st = record.get("stability", {})
+    out: list[str] = []
+    out.append(f"# 回归运行 `{m.get('run_id','?')}` — 档位 **{m.get('mode','?')}**")
+    out.append("")
+    out.append(f"- 时间：{m.get('started_at')} → {m.get('ended_at')}（墙钟 "
+               f"{_fmt_cell(record.get('timing',{}).get('total_wall_s'))}s）")
+    out.append(f"- commit：`{m.get('git_commit')}`{'（dirty）' if m.get('git_dirty') else ''}")
+    out.append(f"- 结果：stop_reason=`{st.get('stop_reason')}` · exit={st.get('exit_code')} "
+               f"· 异常={st.get('exceptions')} · 解题 "
+               f"{so.get('questions_solved')}/{so.get('questions_total')}")
+    for note in record.get("_notes", []) or []:
+        out.append(f"- 备注：{note}")
+    out.append("")
+    out.append("| 组 | 字段 | 值 |")
+    out.append("|---|---|---|")
+    for g in _GROUP_ORDER:
+        d = record.get(g, {})
+        if not isinstance(d, dict):
+            continue
+        title = _GROUP_TITLES.get(g, g)
+        for k, v in d.items():
+            out.append(f"| {title} | `{k}` | {_fmt_cell(v)} |")
+    per = record.get("per_challenge") or []
+    if per:
+        out.append("")
+        out.append("## 每题 per_challenge")
+        out.append("| id | 分类 | 难度 | 解出 | 问题解/总 | 提交 | 错 | 判定 |")
+        out.append("|---|---|---|---|---|---|---|---|")
+        for c in per:
+            out.append(
+                f"| {c.get('id')} | {c.get('category')} | {c.get('difficulty')} "
+                f"| {_fmt_cell(c.get('solved'))} "
+                f"| {c.get('questions_solved')}/{c.get('questions_total')} "
+                f"| {c.get('submissions')} | {c.get('wrong')} "
+                f"| {_fmt_cell(c.get('stop_reason'))} |"
+            )
+    out.append("")
+    return "\n".join(out)
+
+
+def _render_trace(probes: dict[str, Any]) -> str:
+    """Interleave the model's per-turn action with the command result it drove,
+    so a reader can see exactly what the agent tried and why it stalled."""
+    llm = probes.get("llm")
+    ex = probes.get("execution")
+    actions = list(getattr(llm, "actions", []) or [])
+    transcript = list(getattr(ex, "transcript", []) or [])
+    lines = ["===== AGENT 轨迹（逐轮）====="]
+    n = max(len(actions), len(transcript))
+    if n == 0:
+        lines.append("  （无动作记录）")
+    for i in range(n):
+        if i < len(actions):
+            lines.append(f"[turn {i+1}] 模型→ {actions[i]}")
+        if i < len(transcript):
+            t = transcript[i]
+            if "error" in t:
+                lines.append(f"          命令× {t['cmd']}  -> 异常 {t['error']}")
+            else:
+                to = " TIMEOUT" if t.get("timed_out") else ""
+                tail = (t.get("tail") or "").replace("\n", " ⏎ ")
+                lines.append(f"          命令$ {t['cmd']}")
+                lines.append(f"          exit={t.get('exit')}{to}  out={tail[:220]}")
+    return "\n".join(lines)
+
+
+def _render_console(record: dict[str, Any]) -> str:
+    """Compact aligned highlights for the terminal (full table goes to the .md)."""
+    g = record.get
+    so, ve, bu, mo, pl, ti, st = (
+        g("solving", {}), g("verdicts", {}), g("budget", {}), g("model", {}),
+        g("platform", {}), g("timing", {}), g("stability", {}),
+    )
+    rows = [
+        ("解题", f"{so.get('questions_solved')}/{so.get('questions_total')} "
+                f"(rate {_fmt_cell(so.get('solve_rate'))}, "
+                f"fully={_fmt_cell(so.get('fully_solved'))})"),
+        ("判定", f"correct={ve.get('correct')} wrong={ve.get('wrong')} "
+                f"capped={ve.get('capped')} ungraded={ve.get('ungraded')} "
+                f"paused={ve.get('paused')}"),
+        ("预算", f"turns={bu.get('turns_used')} tokens={bu.get('tokens_total')} "
+                f"tool_calls={bu.get('tool_calls_made')} model_calls={mo.get('model_calls')}"),
+        ("平台", f"api={pl.get('api_calls_total')} {_fmt_cell(pl.get('api_calls_by_method'))} "
+                f"4xx={_fmt_cell(pl.get('http_4xx'))} 5xx={_fmt_cell(pl.get('http_5xx'))}"),
+        ("计时", f"wall={_fmt_cell(ti.get('total_wall_s'))}s "
+                f"first_flag={_fmt_cell(ti.get('time_to_first_flag_s'))} "
+                f"model_avg={_fmt_cell(ti.get('model_call_s_avg'))}s"),
+        ("稳定", f"exit={st.get('exit_code')} 异常={st.get('exceptions')} "
+                f"result_written={_fmt_cell(st.get('result_json_written'))} "
+                f"no_secret_leak={_fmt_cell(g('artifact',{}).get('no_secret_leak'))}"),
+    ]
+    w = max(len(r[0]) for r in rows)
+    lines = ["  ┌─ 字段速览 ─"]
+    lines += [f"  │ {k.ljust(w)} │ {v}" for k, v in rows]
+    per = record.get("per_challenge") or []
+    for c in per:
+        lines.append(
+            f"  │   · {c.get('id')} [{c.get('category')}/{c.get('difficulty')}] "
+            f"solved={_fmt_cell(c.get('solved'))} "
+            f"q={c.get('questions_solved')}/{c.get('questions_total')} "
+            f"submit={c.get('submissions')} wrong={c.get('wrong')}"
+        )
+    lines.append("  └─")
+    return "\n".join(lines)
+
+
 def _mode_runner(mode: str):
     return {"smoke": _run_smoke, "integration": _run_integration, "solve": _run_solve}[mode]
 
@@ -1057,7 +1282,10 @@ async def _dispatch(
         return await _run_smoke(result_path, t0)
     if mode == "integration":
         return await _run_integration(result_path, t0, args.competition, secret_env)
-    return await _run_solve(result_path, t0, args.competition, secret_env, args.timeout)
+    return await _run_solve(
+        result_path, t0, args.competition, secret_env, args.timeout,
+        args.challenge, args.max_turns,
+    )
 
 
 def main() -> int:
@@ -1071,6 +1299,12 @@ def main() -> int:
     p.add_argument("--secret-env", default=os.path.join(_REPO_ROOT, "docs", "secret.env"),
                    help="integration/solve 读取的凭据文件（KEY=value）")
     p.add_argument("--timeout", type=float, default=1800.0, help="solve 模式整体墙钟上限（秒）")
+    p.add_argument("--challenge", default=None,
+                   help="solve 档只做这一道题（dev 定向；附件会预拉到 agent 工作区）")
+    p.add_argument("--max-turns", type=int, default=None,
+                   help="solve 档每题轮次上限（dev 兜底，防止一道题跑太久）")
+    p.add_argument("--trace", action="store_true",
+                   help="打印并保存 agent 的逐轮动作 + 命令结果（看它到底做了什么）")
     args = p.parse_args()
 
     _GIT_COMMIT, _GIT_DIRTY = _git_info()
@@ -1117,12 +1351,25 @@ def main() -> int:
     record_path = os.path.join(out_dir, f"{run_id}.json")
     with open(record_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
+    table_path = os.path.join(out_dir, f"{run_id}.md")
+    with open(table_path, "w", encoding="utf-8") as f:
+        f.write(_render_markdown(record))
     print(f"[regression] 记录已写入: {record_path}")
+    print(f"[regression] 字段表格: {table_path}")
     print(
         f"[regression] 档位={args.mode} 解出={record['solving']['questions_solved']}"
         f"/{record['solving']['questions_total']} "
         f"stop_reason={record['stability']['stop_reason']}"
     )
+    print(_render_console(record))
+
+    if args.trace:
+        trace = _render_trace(probes)
+        trace_path = os.path.join(out_dir, f"{run_id}.trace.txt")
+        with open(trace_path, "w", encoding="utf-8") as f:
+            f.write(trace)
+        print(f"[regression] 轨迹已写入: {trace_path}")
+        print(trace)
 
     # 基线比对 / 存基线
     if args.save_baseline:
