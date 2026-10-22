@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -44,9 +45,24 @@ class SubprocessAdapter:
         *,
         max_concurrency: int = 4,
         output_cap: int = 64000,
+        posix_shell: str | None = None,
     ) -> None:
         self._root = os.path.abspath(root) if root else tempfile.mkdtemp(prefix="chal-")
         os.makedirs(self._root, exist_ok=True)
+        # Prod is a Linux container whose /bin/sh honors POSIX syntax (`;` and `&&`
+        # chaining, ls/cat/unzip); the agent is prompted for that world. On Windows
+        # DEV, create_subprocess_shell would use cmd.exe, which does NOT treat `;`
+        # as a separator — the agent's chained commands then fail. Mirror prod by
+        # routing commands through a POSIX shell (bash/sh) when one is on PATH.
+        # `posix_shell` overrides detection ("" forces cmd.exe; a path forces that
+        # shell) for tests / explicit config. On real POSIX we leave it None and
+        # create_subprocess_shell already uses /bin/sh.
+        if posix_shell is not None:
+            self._posix_shell = posix_shell or None
+        elif IS_WINDOWS:
+            self._posix_shell = shutil.which("bash") or shutil.which("sh")
+        else:
+            self._posix_shell = None
         # Per-instance (NOT module-global) gate on concurrently running commands.
         # Created here; asyncio.Semaphore binds lazily to the running loop on
         # first ``await`` (Python 3.10+), so construction outside a loop is fine.
@@ -113,13 +129,24 @@ class SubprocessAdapter:
         # keeps its "don't raise on ordinary failures" contract.
         await loop.run_in_executor(None, lambda: os.makedirs(cwd, exist_ok=True))
 
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            **self._spawn_kwargs(),
-        )
+        if self._posix_shell:
+            # Explicit `<shell> -c "<cmd>"` so Windows dev runs the agent's POSIX
+            # command line through bash/sh instead of cmd.exe (prod parity).
+            proc = await asyncio.create_subprocess_exec(
+                self._posix_shell, "-c", cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                **self._spawn_kwargs(),
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                **self._spawn_kwargs(),
+            )
 
         timed_out = False
         try:

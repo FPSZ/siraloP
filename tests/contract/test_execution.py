@@ -8,7 +8,19 @@ import sys
 
 from agent.adapters.execution.subprocess_exec import SubprocessAdapter
 
-PY = f'"{sys.executable}"'
+# Forward slashes so the quoted interpreter path is safe under both cmd.exe and a
+# POSIX shell (Windows dev routes through bash; backslashes are escape chars there).
+PY = '"' + sys.executable.replace("\\", "/") + '"'
+
+
+async def test_semicolon_chaining_runs_both_commands():
+    # `;` is POSIX chaining the agent relies on (prod = Linux /bin/sh). This must
+    # work in dev too — on Windows the adapter routes through bash/sh, not cmd.exe.
+    res = await SubprocessAdapter().run(
+        f"{PY} -c \"print('one')\" ; {PY} -c \"print('two')\""
+    )
+    assert res.exit_code == 0
+    assert "one" in res.stdout and "two" in res.stdout
 
 
 async def test_run_captures_stdout_and_exit0():
