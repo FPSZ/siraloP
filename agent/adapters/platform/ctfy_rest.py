@@ -447,7 +447,8 @@ class CtfyRestAdapter:
             ),
             score=cls._as_float(
                 cls._pick(e, "score", "points", "value", "total"), default=0.0
-            ),
+            )
+            or 0.0,
             solved=cls._as_int(
                 cls._pick(e, "solved", "solves", "solve_count", "num_solved"),
                 default=0,

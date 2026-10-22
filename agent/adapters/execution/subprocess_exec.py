@@ -20,8 +20,10 @@ import asyncio
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from agent.domain.state import ExecResult
 
@@ -145,9 +147,9 @@ class SubprocessAdapter:
         )
 
     @staticmethod
-    def _spawn_kwargs() -> dict[str, object]:
+    def _spawn_kwargs() -> dict[str, Any]:
         """Spawn options that make the child the head of its own killable group."""
-        if IS_WINDOWS:
+        if sys.platform == "win32":
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {"start_new_session": True}
 
@@ -156,7 +158,7 @@ class SubprocessAdapter:
         pid = proc.pid
         if pid is None:
             return
-        if IS_WINDOWS:
+        if sys.platform == "win32":
             if not await self._taskkill(pid):
                 self._safe_kill(proc)  # fallback: at least kill the root
             return

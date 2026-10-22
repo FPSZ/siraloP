@@ -7,6 +7,8 @@ RunResult (the entrypoint always writes it — CTFY-0001 §3: not writing == fai
 """
 from __future__ import annotations
 
+from typing import cast
+
 from agent.domain.bus import MessageBus
 from agent.domain.solver import CliHarnessSolver, ReActSolver, SolverStrategy
 from agent.domain.state import (
@@ -131,7 +133,8 @@ class Coordinator:
                     self.execution, self.platform, cli=cli, clock=self.clock
                 )
             )
-        return list(lanes), lanes  # type: ignore[return-value]
+        strategies = cast(list[SolverStrategy], list(lanes))
+        return strategies, lanes
 
     # -- the run ------------------------------------------------------------
     async def run(self) -> RunResult:

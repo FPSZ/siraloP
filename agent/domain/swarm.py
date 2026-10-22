@@ -78,7 +78,7 @@ class Swarm:
         return result if isinstance(result, RunStatus) else RunStatus.FAILED
 
     @staticmethod
-    async def _cancel(tasks: set[asyncio.Future[RunStatus]]) -> None:
+    async def _cancel(tasks: set[asyncio.Task[RunStatus]]) -> None:
         for t in tasks:
             if not t.done():
                 t.cancel()
