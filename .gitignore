@@ -16,6 +16,10 @@ scratch/
 tmp/
 *.log
 
+# 回归测试运行产物（记录 + 基线；可能含平台/赛事数据，不入库）
+regression/runs/
+regression/*.json
+
 # secrets & runtime artifacts (never commit)
 .env
 .env.*

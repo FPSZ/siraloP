@@ -1,0 +1,62 @@
+{
+  "_comment": "回归判定阈值。见 docs/testing/回归测试字段表.md 的「回归判定」一节。",
+  "_comment_redlines": "redlines 为硬红线，任一不满足即整体 FAIL（与基线无关）。",
+  "redlines": [
+    "exit_code_zero",
+    "result_json_written",
+    "result_json_valid",
+    "no_secret_leak",
+    "exceptions_zero"
+  ],
+  "_comment_metrics": "metrics 为与基线逐项比对。direction=higher_better 时看 min_ratio（本次/基线 低于它则触发）；lower_better 时看 max_ratio（本次/基线 高于它则触发）或 max_abs_increase（绝对增量）。severity 为触发后的级别 WARN|FAIL。缺基线或缺字段则记 SKIP。",
+  "metrics": {
+    "solving.questions_solved": {
+      "direction": "higher_better",
+      "min_ratio": 0.95,
+      "severity": "FAIL",
+      "note": "核心成绩：解出的问题数不得低于基线 95%"
+    },
+    "solving.solve_rate": {
+      "direction": "higher_better",
+      "min_ratio": 0.95,
+      "severity": "FAIL",
+      "note": "核心成绩：解题率不得低于基线 95%"
+    },
+    "timing.time_to_first_flag_s": {
+      "direction": "lower_better",
+      "max_ratio": 1.5,
+      "severity": "WARN",
+      "note": "首旗耗时变慢超 50% 预警"
+    },
+    "verdicts.wrong_rate": {
+      "direction": "lower_better",
+      "max_abs_increase": 0.1,
+      "severity": "WARN",
+      "note": "乱猜指标：错误率绝对值上升超 0.1 预警"
+    },
+    "budget.tokens_per_solve": {
+      "direction": "lower_better",
+      "max_ratio": 1.3,
+      "severity": "WARN",
+      "note": "性价比：每解一题的 token 变高超 30% 预警"
+    },
+    "timing.total_wall_s": {
+      "direction": "lower_better",
+      "max_ratio": 1.2,
+      "severity": "WARN",
+      "note": "总墙钟变慢超 20% 预警"
+    },
+    "timing.model_call_s_p95": {
+      "direction": "lower_better",
+      "max_ratio": 1.5,
+      "severity": "WARN",
+      "note": "模型调用 P95 延迟变慢超 50% 预警"
+    },
+    "platform.api_calls_total": {
+      "direction": "lower_better",
+      "max_ratio": 1.2,
+      "severity": "WARN",
+      "note": "平台 API 调用次数上升超 20% 预警（多队共享请求预算）"
+    }
+  }
+}
