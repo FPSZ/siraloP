@@ -11,9 +11,14 @@ from agent.adapters.llm.gateway import GatewayAdapter
 from agent.domain.state import Msg, ToolDef
 from agent.testing.fakes import FakeClock
 
+# The real 智谱 GLM anthropic-compatible endpoint. Requests must land at
+# {base}/v1/messages — note httpx appends to the base path, so /v1/messages does
+# NOT replace the base's own /api/anthropic segment.
+_GLM_BASE = "https://open.bigmodel.cn/api/anthropic"
 
-def _client(handler) -> httpx.AsyncClient:
-    return httpx.AsyncClient(base_url="https://gw.test", transport=httpx.MockTransport(handler))
+
+def _client(handler, base_url: str = "https://gw.test") -> httpx.AsyncClient:
+    return httpx.AsyncClient(base_url=base_url, transport=httpx.MockTransport(handler))
 
 
 async def test_anthropic_response_mapping():
@@ -42,6 +47,91 @@ async def test_anthropic_response_mapping():
     assert r.tool_calls[0].arguments == {"cmd": "ls"}
     assert (r.input_tokens, r.output_tokens) == (10, 5)
     assert r.stop_reason == "tool_use"
+
+
+async def test_anthropic_real_glm_ignores_thinking_block():
+    """A faithful GLM-4.6 reply (thinking + text) over the bigmodel endpoint.
+
+    Pins two things at once: the request lands at ``{base}/v1/messages`` with the
+    anthropic auth headers, and the parser drops the ``thinking`` block while
+    returning only the ``text`` content plus the real usage/stop_reason.
+    """
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        # httpx appends to the base path: /v1/messages keeps /api/anthropic.
+        assert str(req.url) == _GLM_BASE + "/v1/messages"
+        assert req.url.path.endswith("/v1/messages")
+        assert req.headers["x-api-key"] == "glm-key"
+        assert req.headers["anthropic-version"]  # anthropic-compatible auth
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_01abc",
+                "type": "message",
+                "role": "assistant",
+                "model": "glm-4.6",
+                "content": [
+                    {"type": "thinking", "thinking": "user says ping", "signature": "sig"},
+                    {"type": "text", "text": "pong"},
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 17, "output_tokens": 25, "cache_read_input_tokens": 0},
+            },
+        )
+
+    g = GatewayAdapter(
+        _GLM_BASE, "glm-key", "anthropic", clock=FakeClock(), client=_client(handler, _GLM_BASE)
+    )
+    r = await g.complete([Msg("user", "ping")], model="glm-4.6")
+    assert r.text == "pong"  # the thinking block contributed nothing
+    assert r.tool_calls == []
+    assert r.input_tokens == 17
+    assert r.output_tokens == 25
+    assert r.stop_reason == "end_turn"
+
+
+async def test_anthropic_real_glm_thinking_then_tool_use():
+    """GLM-4.6 reply whose content is a thinking block followed by a tool_use
+    block — the thinking is ignored, the tool_use becomes a ToolCall."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert str(req.url) == _GLM_BASE + "/v1/messages"
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_02def",
+                "type": "message",
+                "role": "assistant",
+                "model": "glm-4.6",
+                "content": [
+                    {"type": "thinking", "thinking": "I should list files", "signature": "s2"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01xyz",
+                        "name": "execute",
+                        "input": {"cmd": "ls -la"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 31, "output_tokens": 12},
+            },
+        )
+
+    g = GatewayAdapter(
+        _GLM_BASE, "glm-key", "anthropic", clock=FakeClock(), client=_client(handler, _GLM_BASE)
+    )
+    r = await g.complete(
+        [Msg("user", "list the files")],
+        model="glm-4.6",
+        tools=[ToolDef("execute", "run a shell command", {"type": "object"})],
+    )
+    assert r.text == ""  # only a thinking + tool_use block; no text content
+    assert len(r.tool_calls) == 1
+    assert r.tool_calls[0].name == "execute"
+    assert r.tool_calls[0].arguments == {"cmd": "ls -la"}
+    assert r.tool_calls[0].id == "toolu_01xyz"
+    assert r.stop_reason == "tool_use"
+    assert (r.input_tokens, r.output_tokens) == (31, 12)
 
 
 async def test_openai_response_mapping():

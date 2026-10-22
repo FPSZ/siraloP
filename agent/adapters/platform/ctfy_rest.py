@@ -2,17 +2,21 @@
 
 All routes are under ``$CTFY_PLATFORM_URL/api/v1`` with
 ``Authorization: Bearer <token>``. Key routes: ``GET /me``,
-``GET /challenges``, ``GET /challenges/{id}``, ``POST /instances``,
+``GET /competitions/{cid}/challenges`` (paginated list),
+``GET /challenges/{id}`` (one challenge, flat route), ``POST /instances``,
 ``POST /submissions``, ``POST /qa/submissions``,
-``GET /competitions/{id}/scoreboard``.
+``GET /competitions/{cid}/scoreboard``. The collection routes read
+``competition_id`` (constructor arg / ``CTFY_EVAL_COMPETITION_ID``).
 
 Resilience (adapters/_resilience.py): every request is wrapped in
 ``with_retry`` and waits through the injected ClockPort, so retries are
 deterministic under FakeClock. 429 / 5xx / a transport error map to
 ``TransientError`` (retried, honouring ``Retry-After``); 401 / 403 raise
-``RuntimeError`` (never retried) — except the one documented case where a
-``403 competition_paused`` on a submission is a *wait*, returned as a
-``PAUSED`` verdict rather than raised (CTFY-0001 §4).
+``RuntimeError`` (never retried) — except ``competition_paused``, which is a
+*wait*, not a failure (CTFY-0001 §4): a submission returns a ``PAUSED``
+verdict (``retry_after_s`` from the body's ``detail``), and a start returns a
+non-READY (STOPPED) instance whose ``poll_after_s`` carries that wait, rather
+than raising.
 
 The wire schema is partly reverse-engineered, so every field is read
 tolerantly with ``.get()`` and a list of plausible key spellings, then mapped
@@ -98,6 +102,7 @@ class CtfyRestAdapter:
         token: str,
         *,
         clock: ClockPort,
+        competition_id: str = "",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base = base_url.rstrip("/") + "/api/v1"
@@ -107,6 +112,10 @@ class CtfyRestAdapter:
             "Accept": "application/json",
         }
         self._clock = clock
+        # Which competition the collection routes (list_challenges, scoreboard)
+        # read from. The platform publishes it as CTFY_EVAL_COMPETITION_ID; empty
+        # is a real state (challenge-only runs), so the guard lives at call time.
+        self._competition_id = competition_id
         # Construction opens no connection (httpx is lazy), so import/build is
         # network-free. An injected client is reused as-is and never closed by us.
         self._client = client if client is not None else httpx.AsyncClient(timeout=30)
@@ -119,23 +128,49 @@ class CtfyRestAdapter:
         d = self._unwrap(self._json_dict(resp), "data", "user", "account", "result")
         return Account(
             id=self._as_str(self._pick(d, "id", "user_id", "account_id", "uid", "sub")),
+            # Real /me carries display_name (no name/username), so it is the
+            # primary spelling; the rest stay as tolerant fallbacks.
             name=self._as_str(
-                self._pick(d, "name", "username", "display_name", "handle",
-                           "team", "team_name", default="")
+                self._pick(d, "display_name", "name", "username", "handle",
+                           "team_name", "team", default="")
             ),
         )
 
     async def list_challenges(self) -> list[Challenge]:
-        resp = await self._request("GET", "/challenges")
-        self._checked(resp, "GET /challenges")
-        items = self._as_list(
-            self._json(resp), "challenges", "data", "items", "results"
-        )
+        if not self._competition_id:
+            raise RuntimeError(
+                "list_challenges needs a competition id, but none was configured. "
+                "Set CTFY_EVAL_COMPETITION_ID (passed to CtfyRestAdapter as "
+                "competition_id) to the competition to enumerate."
+            )
+        path = f"/competitions/{self._competition_id}/challenges"
         out: list[Challenge] = []
-        for c in items:
-            parsed = self._parse_challenge(c)
-            if parsed is not None:
-                out.append(parsed)
+        seen: set[str] = set()
+        limit = 50
+        offset = 0
+        # Page until the server's `total` is covered (authoritative when present),
+        # falling back to a short/empty page. The cap bounds a misbehaving server.
+        for _ in range(200):
+            resp = await self._request(
+                "GET", path, params={"limit": limit, "offset": offset}
+            )
+            self._checked(resp, f"GET {path}")
+            data = self._json(resp)
+            items = self._as_list(data, "items", "challenges", "data", "results")
+            for c in items:
+                parsed = self._parse_challenge(c)
+                if parsed is not None and parsed.id not in seen:
+                    seen.add(parsed.id)
+                    out.append(parsed)
+            if not items:
+                break
+            offset += len(items)
+            total = self._as_int(data.get("total"), default=-1) if isinstance(data, dict) else -1
+            if total >= 0:
+                if offset >= total:
+                    break
+            elif len(items) < limit:
+                break
         return out
 
     async def get_challenge(self, cid: str) -> Challenge:
@@ -152,53 +187,143 @@ class CtfyRestAdapter:
         return parsed
 
     async def start_instance(self, cid: str) -> Instance:
-        resp = await self._request("POST", "/instances", json={"challenge_id": cid})
-        # A 403 competition_paused is possible here (CTFY-0001 §4); the frozen
-        # PlatformPort returns an Instance with no PAUSED phase, so it surfaces
-        # as RuntimeError via _checked (the message carries the paused code).
+        # The POST body MUST carry competition_id: without it the platform routes
+        # the start to the account's default (Agent Track) competition, which is
+        # paused outside a session and 403s (verified against the live API). When
+        # no competition is configured (challenge-only dev runs) we omit it and
+        # let the platform use its own default.
+        body: dict[str, Any] = {"challenge_id": cid}
+        if self._competition_id:
+            body["competition_id"] = self._competition_id
+        resp = await self._request("POST", "/instances", json=body)
+        # A 403 competition_paused is possible here (CTFY-0001 §4). The frozen
+        # Instance has no PAUSED phase, so a pause is surfaced as a non-READY
+        # (STOPPED) instance whose poll_after_s carries the platform's wait —
+        # the caller polls and sees it is not ready, instead of crashing.
+        paused = self._paused_instance(resp, cid)
+        if paused is not None:
+            return paused
         self._checked(resp, "POST /instances")
         d = self._unwrap(self._json_dict(resp), "data", "instance", "result")
+        inst = self._instance_from_detail(d, fallback_id=cid, resp=resp)
+        # The create reply (202) is {id, status:"starting", start_wait} with no
+        # services yet; the connectable host/port only appear once the instance
+        # is ready, via GET /instances/{id}. When the create is not ready and has
+        # no service address yet, fetch the authoritative current detail so one
+        # poll still returns real host/port the moment the instance comes up.
+        if inst.status is not InstanceStatus.READY and inst.id and not inst.host:
+            detail = await self._get_instance_detail(inst.id)
+            if detail is not None:
+                inst = self._instance_from_detail(detail, fallback_id=inst.id)
+        return inst
+
+    async def _get_instance_detail(self, iid: str) -> dict[str, Any] | None:
+        """Best-effort GET /instances/{id} for the current state. Never raises:
+        enrichment is optional, so a transport/HTTP error just yields None and the
+        caller keeps the create-reply instance (STARTING) and polls again."""
+        try:
+            resp = await self._request("GET", f"/instances/{iid}")
+        except Exception:
+            return None
+        if not resp.is_success:
+            return None
+        return self._unwrap(self._json_dict(resp), "data", "instance", "result")
+
+    def _instance_from_detail(
+        self, d: dict[str, Any], *, fallback_id: str, resp: httpx.Response | None = None
+    ) -> Instance:
+        """Map an instance body (POST create reply or GET detail) onto Instance.
+
+        The ready shape nests the connection under ``services: [{service_type,
+        host, port, access, label}]`` (benchmark uses access="vpn" on raw tcp;
+        the real Agent Track uses access="tls_sni" on 443). Fall back to flat
+        top-level host/port for tolerance.
+        """
+        svc = self._primary_service(d)
+        src = svc if svc is not None else d
         poll = self._as_float(
-            self._pick(d, "poll_after_s", "poll_after", "retry_after_s", "retry_after"),
+            self._pick(
+                d, "poll_after_s", "poll_after", "retry_after_s", "retry_after",
+                "start_wait",
+            ),
             default=None,
         )
-        if poll is None:
+        if poll is None and resp is not None:
             poll = self._retry_after(resp)
         return Instance(
-            id=self._as_str(self._pick(d, "id", "instance_id", "iid", default=cid)),
+            id=self._as_str(self._pick(d, "id", "instance_id", "iid", default=fallback_id)),
             host=self._as_str(
-                self._pick(d, "host", "hostname", "address", "ip", "sni",
+                self._pick(src, "host", "hostname", "address", "ip", "sni",
                            "server", default="")
             ),
-            port=self._as_int(self._pick(d, "port", "tcp_port"), default=443),
-            tls_sni=self._tls_flag(d),
+            port=self._as_int(self._pick(src, "port", "tcp_port"), default=443),
+            tls_sni=self._service_tls(src),
             status=self._instance_status(d),
             poll_after_s=poll if poll is not None else 2.0,
             expires_at=self._expires_at(d),
         )
 
+    @classmethod
+    def _primary_service(cls, d: dict[str, Any]) -> dict[str, Any] | None:
+        """The connectable service from a ready instance's ``services`` array, or
+        None when the instance is still starting (no services published yet)."""
+        raw = cls._pick(d, "services", "endpoints", default=None)
+        svcs = [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
+        if not svcs:
+            return None
+
+        def rank(s: dict[str, Any]) -> tuple[bool, bool]:
+            has_host = bool(
+                cls._pick(s, "host", "hostname", "address", "ip", "server")
+            )
+            label = cls._as_str(
+                cls._pick(s, "label", "name", "service_type", default="")
+            ).lower()
+            primary = any(w in label for w in ("app", "main", "web", "http", "service"))
+            return (has_host, primary)
+
+        return max(svcs, key=rank)
+
+    @classmethod
+    def _service_tls(cls, s: dict[str, Any]) -> bool:
+        """Whether to speak TLS+SNI to a service. ``access`` is authoritative when
+        present (tls_sni -> True, vpn/raw tcp -> False); else infer from scheme."""
+        access = cls._as_str(cls._pick(s, "access", "exposure", default="")).lower()
+        if access in ("tls_sni", "sni", "tls", "https"):
+            return True
+        if access in ("vpn", "raw", "tcp", "plain"):
+            return False
+        return cls._tls_flag(s)
+
     async def submit(self, cid: str, qid: str, answer: str) -> Verdict:
         resp = await self._request(
             "POST", "/submissions",
-            json={"challenge_id": cid, "question_id": qid, "submission": answer},
+            json={"challenge_id": cid, "question_id": qid, "answer": answer},
         )
         return self._grade(resp)
 
     async def submit_qa(self, cid: str, qid: str, answer: str) -> Verdict:
         resp = await self._request(
             "POST", "/qa/submissions",
-            json={"challenge_id": cid, "question_id": qid, "submission": answer},
+            json={"challenge_id": cid, "question_id": qid, "answer": answer},
         )
         return self._grade(resp)
 
     async def scoreboard(self, competition_id: str) -> Scoreboard:
-        resp = await self._request(
-            "GET", f"/competitions/{competition_id}/scoreboard"
-        )
-        self._checked(resp, f"GET /competitions/{competition_id}/scoreboard")
+        # The port passes the competition explicitly; fall back to the one fixed
+        # at construction so a caller with only a configured adapter still works.
+        cid = competition_id or self._competition_id
+        if not cid:
+            raise RuntimeError(
+                "scoreboard needs a competition id (argument or the adapter's "
+                "configured competition_id / CTFY_EVAL_COMPETITION_ID)."
+            )
+        resp = await self._request("GET", f"/competitions/{cid}/scoreboard")
+        self._checked(resp, f"GET /competitions/{cid}/scoreboard")
         data = self._json(resp)
         items = self._as_list(
-            data, "entries", "standings", "scoreboard", "data", "results", "teams"
+            data, "items", "entries", "standings", "scoreboard", "data",
+            "results", "teams",
         )
         entries = [
             e for e in (self._parse_entry(x, i) for i, x in enumerate(items))
@@ -283,7 +408,13 @@ class CtfyRestAdapter:
         """
         data = self._json_dict(resp)
         inner = self._unwrap(data, "data", "result", "submission")
-        merged: dict[str, Any] = {**data, **inner} if isinstance(inner, dict) else data
+        merged: dict[str, Any] = {**data, **inner} if isinstance(inner, dict) else dict(data)
+        # A `competition_paused` error nests its fields under `detail`
+        # (message / next_session_starts_at / retry_after_s); lift them so the
+        # paused branch and _paused_message can read them at the top level.
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            merged = {**merged, **detail}
         signals = {
             str(merged[k]).strip().lower()
             for k in ("code", "status", "result", "verdict", "state", "outcome", "grade")
@@ -357,6 +488,45 @@ class CtfyRestAdapter:
             parts.append(f"retry_after_s={ra}")
         return "; ".join(str(p) for p in parts)
 
+    def _paused_instance(self, resp: httpx.Response, cid: str) -> Instance | None:
+        """A paused start (CTFY-0001 §4) as a non-READY Instance, or None.
+
+        Returns ``None`` for a success or for an ordinary (non-paused) error, so
+        the caller still runs ``_checked`` and raises on a real auth/other 4xx.
+        For ``competition_paused`` (403, or 409/423) it returns a STOPPED
+        instance whose ``poll_after_s`` carries the platform's ``retry_after_s``
+        — the session ended and resumes later, so the caller waits, not crashes.
+        """
+        if resp.is_success:
+            return None
+        data = self._json_dict(resp)
+        merged: dict[str, Any] = dict(data)
+        detail = data.get("detail")
+        if isinstance(detail, dict):
+            merged = {**merged, **detail}
+        signals = {
+            str(merged[k]).strip().lower()
+            for k in ("code", "status", "result", "state", "outcome")
+            if isinstance(merged.get(k), str)
+        }
+        is_paused = (
+            resp.status_code in (409, 423)
+            or bool(signals & _PAUSED)
+            or self._flag(merged, "paused") is True
+        )
+        if not is_paused:
+            return None
+        retry = self._as_float(
+            self._pick(merged, "retry_after_s", "retry_after"), default=None
+        )
+        if retry is None:
+            retry = self._retry_after(resp)
+        return Instance(
+            id=self._as_str(self._pick(merged, "id", "instance_id", "iid", default=cid)),
+            status=InstanceStatus.STOPPED,
+            poll_after_s=retry if retry is not None else 2.0,
+        )
+
     @staticmethod
     def _attempts_left(d: dict[str, Any]) -> int | None:
         for k in ("attempts_left", "remaining_attempts", "attempts_remaining",
@@ -386,6 +556,18 @@ class CtfyRestAdapter:
                 parsed = cls._parse_question(q)
                 if parsed is not None:
                     questions.append(parsed)
+        # Real <challenge> carries my_solved_question_ids: the ids this team has
+        # already solved. Mark them answered so unanswered() skips them and the
+        # gating re-fetch (get_challenge after a correct answer) is accurate.
+        solved_ids = set(
+            cls._as_str_list(
+                cls._pick(c, "my_solved_question_ids", "solved_question_ids", default=[])
+            )
+        )
+        if solved_ids:
+            for q in questions:
+                if q.id in solved_ids:
+                    q.answered = True
         gated_n = cls._as_int(
             cls._pick(c, "gated_questions", "gated", "gated_count"),
             default=sum(1 for q in questions if q.locked),
@@ -404,7 +586,8 @@ class CtfyRestAdapter:
                 cls._pick(c, "points", "value", "score", "point"), default=0
             ),
             solves=cls._as_int(
-                cls._pick(c, "solves", "solve_count", "solved_count"), default=0
+                cls._pick(c, "solves_count", "solves", "solve_count", "solved_count"),
+                default=0,
             ),
         )
 

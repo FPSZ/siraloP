@@ -44,7 +44,10 @@ def build_for_image(settings: Settings) -> Wiring:
     platform injected — reachable even under ``internet_policy=deny``.
     """
     clock = RealClock()
-    platform = CtfyRestAdapter(settings.platform_url, settings.token, clock=clock)
+    platform = CtfyRestAdapter(
+        settings.platform_url, settings.token,
+        clock=clock, competition_id=settings.competition_id,
+    )
     llm = GatewayAdapter(
         settings.llm_base_url, settings.llm_api_key, settings.llm_flavor, clock=clock
     )
@@ -64,7 +67,10 @@ def build_for_dev(settings: Settings) -> Wiring:
     documented swap points — construct them here once implemented.
     """
     clock = RealClock()
-    platform = CtfyRestAdapter(settings.platform_url, settings.token, clock=clock)
+    platform = CtfyRestAdapter(
+        settings.platform_url, settings.token,
+        clock=clock, competition_id=settings.competition_id,
+    )
     llm = GatewayAdapter(
         settings.llm_base_url, settings.llm_api_key, settings.llm_flavor, clock=clock
     )
