@@ -14,6 +14,9 @@ from agent.domain.solver import CliHarnessSolver, ReActSolver, SolverStrategy
 from agent.domain.state import (
     Budget,
     Challenge,
+    Instance,
+    InstanceStatus,
+    RunMode,
     RunResult,
     RunStatus,
     Task,
@@ -78,43 +81,37 @@ class Coordinator:
         return sorted(challenges, key=self._roi_key)
 
     # -- budgeting ----------------------------------------------------------
-    def _allocate_budget(self, n_challenges: int) -> Budget:
-        """A per-challenge Budget from task.max_turns / limits (ADR-0001 §3.6)."""
-        max_turns = None
-        max_tokens = None
-        if self.task is not None:
-            if isinstance(self.task.max_turns, int):
-                # share the run-level turn cap across challenges (floor of 1)
-                max_turns = max(1, self.task.max_turns // max(1, n_challenges))
-            limits = self.task.limits or {}
-            mt = limits.get("max_tokens")
-            if isinstance(mt, int):
-                max_tokens = max(1, mt // max(1, n_challenges))
-        st_tokens = getattr(self.settings, "max_tokens", None)
-        if max_tokens is None and isinstance(st_tokens, int):
-            max_tokens = max(1, st_tokens // max(1, n_challenges))
-        return Budget(max_turns=max_turns, max_tokens=max_tokens)
+    def _allocate_budget(self) -> Budget:
+        """One run-level budget shared by every challenge and solver lane."""
+        max_turns = (
+            self.task.max_turns
+            if self.task is not None
+            else getattr(self.settings, "max_turns", None)
+        )
+        limits = self.task.limits if self.task is not None else {}
+        max_tokens = limits.get("max_tokens")
+        if not isinstance(max_tokens, int):
+            max_tokens = getattr(self.settings, "max_tokens", None)
+        return Budget(
+            max_turns=max_turns if isinstance(max_turns, int) else None,
+            max_tokens=max_tokens if isinstance(max_tokens, int) else None,
+        )
 
     # -- lane construction --------------------------------------------------
     def _build_lanes(
-        self, challenge: Challenge, budget: Budget
+        self,
+        challenge: Challenge,
+        budget: Budget,
+        *,
+        instance: Instance | None = None,
+        run_mode: RunMode = RunMode.INSTANCE,
     ) -> tuple[list[SolverStrategy], list[object]]:
-        """Build the solver lanes for one challenge.
-
-        Returns (strategies, lanes): the Swarm consumes ``strategies`` while we
-        keep the concrete ``lanes`` to read their answers/accounting afterwards.
-        Each lane gets its OWN Budget copy (independent stop-loss per lane).
-        """
+        """Build competing lanes against the same run budget and ready target."""
         diff = (challenge.difficulty or "").strip().lower()
         want = _LANES_BY_DIFFICULTY.get(diff, _DEFAULT_LANES)
         models = self._models()[:want] or ["default"]
         lanes: list[object] = []
         for model in models:
-            lane_budget = Budget(
-                max_turns=budget.max_turns,
-                max_tokens=budget.max_tokens,
-                deadline=budget.deadline,
-            )
             lanes.append(
                 ReActSolver(
                     self.llm,
@@ -123,14 +120,22 @@ class Coordinator:
                     self.bus,
                     model=model,
                     clock=self.clock,
-                    budget=lane_budget,
+                    budget=budget,
+                    instance=instance,
+                    run_mode=run_mode,
                 )
             )
         cli = getattr(self.settings, "harness_cli", "")
         if cli:
             lanes.append(
                 CliHarnessSolver(
-                    self.execution, self.platform, cli=cli, clock=self.clock
+                    self.execution,
+                    self.platform,
+                    cli=cli,
+                    clock=self.clock,
+                    budget=budget,
+                    instance=instance,
+                    run_mode=run_mode,
                 )
             )
         strategies = cast(list[SolverStrategy], list(lanes))
@@ -150,21 +155,27 @@ class Coordinator:
             result.stop_reason = "no challenges"
             return result
 
-        budget = self._allocate_budget(len(ordered))
+        budget = self._allocate_budget()
         statuses: list[RunStatus] = []
         for challenge in ordered:
             try:
                 status = await self._solve_one(challenge, budget, result)
                 statuses.append(status)
             except Exception as e:  # one bad challenge never sinks the run
+                statuses.append(RunStatus.FAILED)
                 result.stop_reason = f"error on {challenge.id}: {e!r}"
                 continue
 
-        result.fully_solved = bool(ordered) and all(
+        result.fully_solved = len(statuses) == len(ordered) and all(
             s is RunStatus.SOLVED for s in statuses
         )
         if not result.stop_reason:
-            result.stop_reason = "completed"
+            if result.fully_solved:
+                result.stop_reason = "completed"
+            elif budget.exhausted(now=self.clock.now()):
+                result.stop_reason = "budget_exhausted"
+            else:
+                result.stop_reason = "incomplete"
         return result
 
     async def _obtain_challenges(self) -> list[Challenge]:
@@ -172,12 +183,68 @@ class Coordinator:
             return [self.task.challenge]
         return list(await self.platform.list_challenges())
 
+    def _run_mode(self, challenge: Challenge) -> RunMode:
+        if self.task is not None and (
+            self.task.raw.get("run_mode") or self.task.run_mode is not RunMode.INSTANCE
+        ):
+            return self.task.run_mode
+        if challenge.questions and all(
+            q.choices or q.fmt in ("single", "multi") for q in challenge.questions
+        ):
+            return RunMode.QA
+        return RunMode.INSTANCE
+
+    async def _prepare_instance(self, cid: str, budget: Budget) -> Instance | None:
+        instance = await self.platform.start_instance(cid)
+        while instance.status is InstanceStatus.STARTING:
+            if budget.exhausted(now=self.clock.now()):
+                return None
+            await self.clock.sleep(instance.poll_after_s)
+            if budget.exhausted(now=self.clock.now()):
+                return None
+            instance = await self.platform.start_instance(cid)
+        if not instance.ready or not instance.host:
+            raise RuntimeError(f"instance {instance.id!r} is not a reachable ready target")
+        return instance
+
     async def _solve_one(
         self, challenge: Challenge, budget: Budget, result: RunResult
     ) -> RunStatus:
-        if not challenge.unanswered():
+        mode = self._run_mode(challenge)
+        if mode not in (RunMode.INSTANCE, RunMode.QA):
+            raise ValueError(f"unsupported run mode: {mode.value}")
+        if (
+            challenge.questions
+            and challenge.gated_questions == 0
+            and all(q.answered for q in challenge.questions)
+        ):
             return RunStatus.SOLVED
-        strategies, lanes = self._build_lanes(challenge, budget)
+        if budget.exhausted(now=self.clock.now()):
+            return RunStatus.GIVEN_UP
+        if not challenge.questions or (
+            not challenge.unanswered() and challenge.gated_questions > 0
+        ):
+            answered = {q.id for q in challenge.questions if q.answered}
+            challenge = await self.platform.get_challenge(challenge.id)
+            for question in challenge.questions:
+                question.answered = question.answered or question.id in answered
+            mode = self._run_mode(challenge)
+        if not challenge.questions:
+            raise ValueError(f"challenge {challenge.id!r} has no questions")
+        if not challenge.unanswered():
+            return (
+                RunStatus.SOLVED
+                if challenge.gated_questions == 0 and all(q.answered for q in challenge.questions)
+                else RunStatus.GIVEN_UP
+            )
+        instance = None
+        if mode is RunMode.INSTANCE:
+            instance = await self._prepare_instance(challenge.id, budget)
+            if instance is None:
+                return RunStatus.GIVEN_UP
+        strategies, lanes = self._build_lanes(
+            challenge, budget, instance=instance, run_mode=mode
+        )
         lane_max = _LANES_BY_DIFFICULTY.get(
             (challenge.difficulty or "").strip().lower(), _DEFAULT_LANES
         )

@@ -21,6 +21,7 @@ def _question(d: dict[str, Any]) -> Question:
         id=str(d.get("id", "")),
         prompt=str(d.get("prompt", "")),
         requires=list(d.get("requires", []) or []),
+        answered=bool(d.get("answered", False)),
         locked=bool(d.get("locked", False)),
         choices=list(d.get("choices", []) or []),
         fmt=str(d.get("format", d.get("fmt", ""))),
@@ -33,8 +34,6 @@ def _challenge(d: dict[str, Any]) -> Challenge:
         name=str(d.get("name", "")),
         category=str(d.get("category", "")),
         description=str(d.get("description", "")),
-        questions=[_question(q) for q in (d.get("questions", []) or [])],
-        gated_questions=int(d.get("gated_questions", 0) or 0),
         difficulty=str(d.get("difficulty", "")),
     )
 
@@ -57,9 +56,13 @@ def load_task(settings: Settings) -> Task:
     if challenge is None and settings.challenge_id:
         challenge = Challenge(id=settings.challenge_id)
 
+    if challenge is not None:
+        challenge.questions = [_question(q) for q in (raw.get("questions") or [])]
+        challenge.gated_questions = int(raw.get("gated_questions", 0) or 0)
+
     # max_turns: task.json wins, else env; null means "no budget" (never 0).
-    mt = raw.get("max_turns", None)
-    max_turns = mt if isinstance(mt, int) else settings.max_turns
+    mt = raw.get("max_turns", settings.max_turns)
+    max_turns = mt if mt is None or isinstance(mt, int) else settings.max_turns
 
     return Task(
         run_mode=RunMode.parse(raw.get("run_mode")),
