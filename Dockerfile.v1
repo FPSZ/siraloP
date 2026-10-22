@@ -1,0 +1,20 @@
+# Minimal bootstrap image for the FIRST agent registration + submission-flow test.
+# Builds behind the GFW: uses a locally-present python base (no Docker Hub pull)
+# and installs the pure-Python deps via a China PyPI mirror; no apt toolchain.
+#
+# The FULL competition image (gdb / chromium / build-essential, for pwn & web
+# challenges) is the main ./Dockerfile and needs a reachable apt + registry
+# mirror. This bootstrap runs the control loop, the model gateway, the platform
+# API client and the subprocess executor — enough to register, validate the
+# submission flow, and attempt logic / QA / simple challenges.
+#
+# Runtime is OFFLINE (internet_policy=deny): everything is baked in here.
+FROM python:3.13-slim
+
+WORKDIR /app
+COPY pyproject.toml /app/
+COPY agent /app/agent
+RUN pip install --no-cache-dir -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# The platform sets cwd=/ctfy/work, so invoke the module by name, never a path.
+ENTRYPOINT ["python", "-m", "agent.entrypoints.image_main"]

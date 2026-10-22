@@ -19,6 +19,11 @@ tmp/
 # secrets & runtime artifacts (never commit)
 .env
 .env.*
+*.env
+*.secret
+secret.env
+secrets/
+docs/secret.env
 !.env.example
 result.json
 .result-*.tmp
