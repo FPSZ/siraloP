@@ -12,14 +12,14 @@
 
 > 范围声明：本项目是**授权高校网络安全竞赛**（京华杯 TPCTF 2026）的参赛作品，所有行为均限定在赛事平台提供的题目环境内、用于自动完成平台布置的挑战并评测智能体能力，不涉及任何平台外目标。
 
-ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗余"。本 ADR 把 `domain/` 拆成四块并逐块定架构：**① 主控循环 ② 工具层 ③ 上下文与记忆 ④ 模型层**，外加跨切面策略。
+ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗余"。本 ADR 把 `domain/` 拆成四块并逐块定架构：**① 控制循环 ② 工具层 ③ 上下文与记忆 ④ 模型层**，外加跨切面策略。
 
 **贯穿结论（四块调研互相印证）**：
 
 > **效率来自"好工具 + 够用的模型 + 简单强循环 + 便宜竞速冗余"，不是来自重型编排。**
 > 多 agent/重协调主要买"稳定性"而非抬高上限，且 token 贵 3–10×（Anthropic、Cognition、《A Second Look》）。因此算力优先投入①②③，而非复杂 agent 图谱。
 
-约束回顾（来自 CTFY-0001 与平台配置）：单容器（无 DinD）、比赛断网（只连平台/模型网关/赛题环境）、便宜 flash 模型（GLM/DeepSeek/Kimi via 网关）、赛题服务 TLS+SNI:443、排名=解题数且比速度、经费有限。
+约束回顾（来自 CTFY-0001 与平台配置）：单容器（无 DinD）、比赛断网（只连平台/模型网关/赛题环境）、便宜 flash 模型（GLM/DeepSeek/Kimi 经网关）、赛题服务 TLS+SNI:443、排名=解题数且比速度、经费有限。
 
 ---
 
@@ -46,7 +46,7 @@ ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗
 
 ---
 
-## 3. ① 主控循环 Control Loop
+## 3. ① 控制循环 Control Loop
 
 **选型**：**事件驱动 `while(有 tool_use){执行→回灌结果}` + ReAct 内核 + 窗口内"活计划/todo 队列"**，即 Plan→Execute→Parse→Iterate。**不**用纯 ReWOO（静态计划在强随机 CTF 下最脆）或纯 Plan-and-Execute。
 
@@ -59,21 +59,21 @@ ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗
 - **失败尝试去重记录**，避免重复撞墙。
 - 思想源自 STRIATUM-CTF 的"协议层"（见 §7 纠偏：STRIATUM 为单 agent）。
 
-**协调层（coordinator）：保持"笨而稳"**
+**协调器（coordinator）：保持"笨而稳"**
 
-- 只做：心跳监控、卡住判定、梯度升级、止损、预算分配、首 flag 取消兄弟。**不替 solver 做题。**
-- **卡住判定用行为信号**（见 §6），不信模型自评。
+- 只做：心跳监控、停滞判定、梯度升级、止损、预算分配、首 flag 取消兄弟。**不替 solver 做题。**
+- **停滞判定用行为信号**（见 §6），不信模型自评。
 - 依据：重型编排贵（~3–10×，部分二手口径 ~15× 待核实）且脆（上下文分散）；收益主要来自并行广度与 token 投入，而非编排智能。
 
 ---
 
 ## 4. ② 工具层 Tool Layer
 
-**选型**：**CodeAct / bash-centric 主干 + 少量结构化封装 + 分类渐进披露**。
+**选型**：**CodeAct / bash-centric 主干 + 少量结构化封装 + 分类渐进式披露**。
 
 - **主动作 = 一个沙箱内 `execute`（Python + bash）**：弱 flash、断网、各题型脚本串联最吃这套，工具定义最省（CodeAct 复杂多步 +20%）。
 - **结构化封装 ~5–12 个**：把 bash 难驱动 / 高频易错的做成工具——调试器、与赛题服务的交互连接（socket/TLS 客户端，赛题 TLS+SNI:443）、`submit_flag`、`notify_coordinator`、headless 浏览器动作等。依据：交互式封装 > 纯 bash（EnIGMA SOTA；CTFAgent 去掉增强工具后显著掉分）。
-- **披露方式 = 轻量"分类命名空间"渐进披露**：按题型 `web_/pwn_/ai_` 分组，**一次只向模型暴露当前题类工具**。**不上 RAG-over-tools**（我们才几十个工具，检索器只添乱）。
+- **披露方式 = 轻量"分类命名空间"渐进式披露**：按题型 `web_/pwn_/ai_` 分组，**一次只向模型暴露当前题类工具**。**不上 RAG-over-tools**（我们才几十个工具，检索器只添乱）。
 - **甜点区**：同时可见 **≤~10 个**，系统总量 **≤~20**（Anthropic Claude Code 本身仅 ~20 个工具）。工具过多必降可靠性（ToolChoiceConfusion）。
 - **工具设计规范（Anthropic）**：合并多步操作、返回高信号字段（非 uuid）、响应默认截断（~25k token）、错误信息可操作、避免功能重叠、按前缀命名空间。
 - **MCP 克制**：可作内部传输（平台本身是 MCP），但别堆叠功能重叠的 server。
@@ -115,7 +115,7 @@ ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗
 | 升级阈值（任一触发） | 连续 **5–8 轮无新进展** / **同动作+同观测重复 ≥4 次** / 判定为 Pwn·Reverse 高难类起步即用强模型 | FrugalGPT cascade 最高省 98%；行为信号比自评可靠                                |
 | 走强模型的题占比     | 目标 **~1/3**（对齐 RouteLLM CPT≈37%）                                                                  | 对强模型省 35–85%                                                              |
 | 竞速宽度             | 易/中题 **2–3 路**；难题不铺宽→单路+升级+止损                                                          | coverage 随样本单调升但**收益递减**，k 小即可                             |
-| 卡住判定             | 行为信号（重复动作/空转/动作熵坍塌）                                                                           | 模型 verbalized confidence 过度自信、校准差                                     |
+| 停滞判定             | 行为信号（重复动作/空转/动作熵坍塌）                                                                           | 模型 verbalized confidence 过度自信、校准差                                     |
 | 不做                 | 对可验证 flag 投票/judge；执行端换最弱模型                                                                     | oracle 已在、弱模型崩盘                                                         |
 
 ---
@@ -134,7 +134,7 @@ ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗
 
 **正面**：每块选型都有实证支撑且对齐平台榜"Claude Code 外壳 + flash 最强"；算力投向高 ROI 处（工具/上下文/竞速），省钱且拿分快；各块边界清晰，可按块分工。
 
-**成本 / 风险**：协议层断路器、分类渐进披露、上下文分层都需前期工程；多 solver 共享总线是自有设计（无现成实证，需自测）；具体参数（默认模型、阈值、竞速宽度）需在练习题库上调。
+**成本 / 风险**：协议层断路器、分类渐进式披露、上下文分层都需前期工程；多 solver 共享总线是自有设计（无现成实证，需自测）；具体参数（默认模型、阈值、竞速宽度）需在练习题库上调。
 
 ---
 
@@ -158,7 +158,7 @@ ADR-0001 定了"Python + 六边形 + 强单 agent 为核 + 多模型竞速做冗
 
 ## 11. 来源
 
-**主控循环**：Anthropic《Building Effective Agents》 [https://www.anthropic.com/research/building-effective-agents](https://www.anthropic.com/research/building-effective-agents) · Cognition《Don't Build Multi-Agents》 [https://cognition.ai/blog/dont-build-multi-agents](https://cognition.ai/blog/dont-build-multi-agents) · STRIATUM-CTF [https://arxiv.org/html/2603.22577v1](https://arxiv.org/html/2603.22577v1) · Claude Agent SDK agent-loop [https://platform.claude.com/docs/en/agent-sdk/agent-loop](https://platform.claude.com/docs/en/agent-sdk/agent-loop)
+**控制循环**：Anthropic《Building Effective Agents》 [https://www.anthropic.com/research/building-effective-agents](https://www.anthropic.com/research/building-effective-agents) · Cognition《Don't Build Multi-Agents》 [https://cognition.ai/blog/dont-build-multi-agents](https://cognition.ai/blog/dont-build-multi-agents) · STRIATUM-CTF [https://arxiv.org/html/2603.22577v1](https://arxiv.org/html/2603.22577v1) · Claude Agent SDK agent-loop [https://platform.claude.com/docs/en/agent-sdk/agent-loop](https://platform.claude.com/docs/en/agent-sdk/agent-loop)
 
 **工具层**：Anthropic《Code execution with MCP》 [https://www.anthropic.com/engineering/code-execution-with-mcp](https://www.anthropic.com/engineering/code-execution-with-mcp) ·《Writing tools for agents》 [https://www.anthropic.com/engineering/writing-tools-for-agents](https://www.anthropic.com/engineering/writing-tools-for-agents) · CodeAct [https://arxiv.org/abs/2402.01030](https://arxiv.org/abs/2402.01030) · ToolChoiceConfusion [https://arxiv.org/abs/2606.06284](https://arxiv.org/abs/2606.06284) · How Many Tools [https://www.alphaxiv.org/abs/2605.24660](https://www.alphaxiv.org/abs/2605.24660) · EnIGMA [https://arxiv.org/abs/2409.16165](https://arxiv.org/abs/2409.16165) · CTFAgent [https://arxiv.org/abs/2506.17644](https://arxiv.org/abs/2506.17644) · Harness design [https://arxiv.org/abs/2609.20804](https://arxiv.org/abs/2609.20804)
 

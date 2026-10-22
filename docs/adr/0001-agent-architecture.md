@@ -15,7 +15,7 @@
 
 | 约束 | 影响 |
 |---|---|
-| 两种接入：连接式(MCP/REST) vs 镜像式 | **入口要可换**：本地开发用连接式，正式交镜像式 |
+| 两种接入：连线模式(MCP/REST) vs 镜像模式 | **入口要可换**：本地开发用连线模式，正式提交镜像模式 |
 | 正式赛 `internet_policy=deny` | 依赖全打进镜像；只有**平台/模型网关/赛题环境**可达 |
 | 容器 caps 全 drop、无 docker socket | **无 DinD**：不能像 ctf-agent 那样每题开子容器 |
 | 资源 8GiB/2CPU/512pid | 并发蜂群要受限 |
@@ -29,7 +29,7 @@
 
 1. **语言用 Python**。理由：① 蓝本 `verialabs/ctf-agent`（BSidesSF 2026 冠军）、CAI、Strix 全是 Python，核心可直接拆进 domain 复用；② LLM agent 生态（pydantic-ai/litellm/各 SDK/MCP）与 CTF 工具链（pwntools/angr/z3）均 Python 原生；③ 官方 `ctfy[client]` SDK 为 Python。
 2. **架构用六边形**。把"会在 dev/正式间变化的边"抽成**端口(Port)**，每种环境提供一个**适配器(Adapter)**；解题智能放在**纯 domain**里，不碰任何 I/O。
-3. **务实收敛**：只抽 4 个端口（Platform / LLM / Execution / 结果输出）+ 3 个驱动入口。不跨环境变化的东西（prompt、message bus）直接放 domain，**不为抽象而抽象**。
+3. **务实收敛**：只抽 4 个端口（Platform / LLM / Execution / 结果写出）+ 3 个驱动入口。不跨环境变化的东西（prompt、message bus）直接放 domain，**不为抽象而抽象**。
 
 ## 3. 详细架构
 
@@ -119,7 +119,7 @@ class ResultSink(Protocol):
 | 端口 | 适配器 | 环境 | 说明 |
 |---|---|---|---|
 | Platform | `CtfyRestAdapter` | 正式/dev | 纯 HTTP，`$PLATFORM_URL/api/v1`，bearer |
-| Platform | `CtfyMcpAdapter` | 正式/连接式 | 走 `/api/v1/mcp/` 的 ~20 工具 |
+| Platform | `CtfyMcpAdapter` | 正式/连线模式 | 走 `/api/v1/mcp/` 的 ~20 工具 |
 | Platform | `CtfdAdapter` | dev | 复用 ctf-agent 逻辑，拿练习/CTFd 先跑通 |
 | LLM | `GatewayAdapter` | **正式** | 指 `LLM_BASE_URL`，断网也可达；litellm/SDK 空构造 |
 | LLM | `LocalKeyAdapter` | dev | 自备 key，本地快速迭代 |
@@ -129,7 +129,7 @@ class ResultSink(Protocol):
 
 > Solver 层另有两种策略，均通过上面端口工作：`ReActSolver`（domain 自己的 thought→action(run)→obs 循环，用 LLMPort+ExecutionPort）、`CliHarnessSolver`（subprocess 调 `claude`/`codex` CLI 当外壳，走 ExecutionPort；印证平台榜"Claude Code 外壳最强"）。
 
-### 3.5 数据流（镜像式正式赛，happy path）
+### 3.5 数据流（镜像模式正式赛，顺利路径）
 
 ```
 1. 平台起容器(cwd=/ctfy/work, 注入 LLM_*/CTFY_* 环境变量)
@@ -178,7 +178,7 @@ class ResultSink(Protocol):
 
 ## 6. 待确认（影响适配器实现，赛前问主办）
 
-- 正式赛最终收**镜像式**还是也收**连接式** → 决定主入口优先级。
+- 正式赛最终收**镜像模式**还是也收**连线模式** → 决定主入口优先级。
 - 模型网关**可用模型清单 + 每队 token/经费额度**。
 - 单容器内**能否联多进程/是否有 pid 更严限制**；镜像大小上限。
 - 是否有 Pwn 题占比（评测榜几乎全 Web）→ 决定执行层要不要重投 arm/qemu、调试器。
