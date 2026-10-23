@@ -426,3 +426,32 @@ async def test_failed_harness_call_still_consumes_reserved_turn(clock):
     assert await solver.solve(ch) is RunStatus.FAILED
     assert budget.used_turns == solver.turns == solver.tool_calls_made == 1
     assert budget.used_tokens == 0
+
+
+async def test_rejected_answer_memory_is_scoped_per_question(clock):
+    # Regression: the WRONG-answer memory must be keyed BY QUESTION. A string that
+    # is wrong for q1 can be the correct answer to a later (gated) q2, so a bare
+    # answer set would wrongly block it from ever reaching q2's grader.
+    ch = make_challenge("c1", n_questions=2)
+    platform = FakePlatform(
+        [ch], answers={("c1", "q1"): "B", ("c1", "q2"): "A"}
+    )
+    seq = iter([("A", "q1"), ("B", "q1"), ("A", "q2")])
+
+    def respond(_messages):
+        try:
+            flag, qid = next(seq)
+        except StopIteration:
+            return LLMResponse(text="(waiting)")
+        return LLMResponse(
+            tool_calls=[ToolCall("submit_flag", {"flag": flag, "question_id": qid})]
+        )
+
+    solver = ReActSolver(
+        FakeLLM(respond), FakeExecution(), platform, MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=10),
+    )
+    status = await solver.solve(ch)
+    assert status is RunStatus.SOLVED
+    # "A" was rejected for q1 but still accepted for q2 (not cross-contaminated).
+    assert solver.answers == {"q1": "B", "q2": "A"}

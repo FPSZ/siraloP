@@ -240,9 +240,12 @@ class ReActSolver:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.tool_calls_made: int = 0
-        # Answers the grader already rejected as WRONG, so we neither resubmit an
-        # identical one (wasting a capped attempt) nor let the model re-guess it.
-        self._rejected: set[str] = set()
+        # (question_id, answer) pairs the grader already rejected as WRONG, so we
+        # neither resubmit an identical one (wasting a capped attempt) nor let the
+        # model re-guess it. Keyed BY QUESTION: the same string can be wrong for
+        # one question yet the correct answer to another (e.g. a gated follow-up),
+        # so a bare-answer set would wrongly block it from ever reaching q2.
+        self._rejected: set[tuple[str, str]] = set()
 
     # -- tool surface -------------------------------------------------------
     def _tools(self, challenge: Challenge) -> list[ToolDef]:
@@ -314,11 +317,13 @@ class ReActSolver:
         if plan:
             goal_lines.append("Plan:")
             goal_lines.extend(f"  {item}" for item in plan)
-        if self._rejected:
-            rejected = ", ".join(sorted(self._rejected)[:8])
+        open_qids = {q.id for q in targets}
+        rejected = sorted({a for (qid, a) in self._rejected if qid in open_qids})
+        if rejected:
             goal_lines.append(
-                "Already rejected by the grader as WRONG (do NOT submit any of "
-                f"these again): {rejected}"
+                "Already rejected by the grader as WRONG for the current open "
+                "question(s) (do NOT submit any of these again): "
+                + ", ".join(rejected[:8])
             )
         if history:
             goal_lines.append(
@@ -615,8 +620,10 @@ class ReActSolver:
         q = self._question_for(challenge, qid)
         if q is None or q.answered or not answer:
             return False
-        # Never spend a capped attempt on an answer the grader already rejected.
-        if answer in self._rejected:
+        # Never spend a capped attempt on an answer the grader already rejected
+        # FOR THIS question (a wrong answer for one question may be right for
+        # another, so the guard is scoped per question id).
+        if (q.id, answer) in self._rejected:
             return False
         is_qa = _is_qa(q, self.run_mode)
         if not is_qa and not explicit and not policy.looks_like_flag(answer):
@@ -664,8 +671,9 @@ class ReActSolver:
                 return False  # grader down; costs no attempt — try again later
             if status is VerdictStatus.CAPPED:
                 return False  # platform says no attempts remain for this question
-            # WRONG: remember it so neither we nor the model retries this value.
-            self._rejected.add(answer)
+            # WRONG: remember (this question, this value) so neither we nor the
+            # model retries it for THIS question (other questions stay unaffected).
+            self._rejected.add((q.id, answer))
             wrong += 1
             return False
         return False
