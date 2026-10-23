@@ -127,6 +127,27 @@ def _instance_context(instance: Instance | None) -> str:
     )
 
 
+def _cmd_fingerprint(call: ToolCall) -> str:
+    """Normalized fingerprint of a tool call for doom-loop detection.
+
+    For an execute, reduce the command to its command words + file basenames,
+    dropping option flags, absolute-path prefixes and shell punctuation, so
+    superficial variants collapse to one key: ``cat f`` / ``cat -n /abs/f`` /
+    ``cat f; echo ---`` all fingerprint the same. Re-issuing a fingerprint means
+    re-doing work already done — the signal a doom-loop hides behind output that
+    merely *looks* novel. Non-execute tools fingerprint by name.
+    """
+    if call.name != "execute":
+        return call.name
+    cmd = str(call.arguments.get("cmd", "")).lower()
+    toks = [
+        t.rsplit("/", 1)[-1]
+        for t in re.split(r"[\s;|&><()]+", cmd)
+        if t and not t.startswith("-")
+    ]
+    return "execute:" + " ".join(sorted(set(toks)))
+
+
 async def _refresh_questions(platform: PlatformPort, challenge: Challenge) -> None:
     """Reveal gates after grading without discarding locally verified answers."""
     try:
@@ -299,8 +320,8 @@ class ReActSolver:
         recent_obs = ""
         invalid_streak = 0
         stalled = 0
-        last_signature = ""
         seen_obs: set[str] = set()  # observation fingerprints: novelty = progress
+        seen_cmds: set[str] = set()  # command fingerprints: repeat = doom-loop
 
         while True:
             if not challenge.unanswered():
@@ -390,23 +411,28 @@ class ReActSolver:
                     if _is_complete(challenge):
                         return self._final_status(challenge, RunStatus.SOLVED)
 
-            # Stall accounting by NOVELTY, not flag-shape: peeling a new archive
-            # layer or reading new file contents IS progress. Only an exact repeat
-            # (same command + same output) or a turn that surfaced nothing new
-            # counts against the stall limit.
+            # Stall accounting: peeling a new archive layer or reading new file
+            # contents IS progress. But a doom-loop hides behind SUPERFICIAL
+            # command variation (cat vs cat -n, find . vs find /) — each variant
+            # yields "novel" output yet re-does work already done. So count a
+            # repeated *command fingerprint* against the stall limit even when its
+            # output looks new (EnIGMA doom-loop: repeated (tool,args), not just
+            # repeated output). Genuine exploration (new command AND new evidence)
+            # does not stall.
             obs_fp = obs[:400]
             novel = obs_fp not in seen_obs
             seen_obs.add(obs_fp)
-            signature = f"{call.name}:{call.arguments.get('cmd', '')}|{obs[:120]}"
+            cmd_fp = _cmd_fingerprint(call)
+            repeat_cmd = cmd_fp in seen_cmds
+            seen_cmds.add(cmd_fp)
             if progressed:
                 stalled = 0
-            elif signature == last_signature:
-                stalled += 1  # exact repeat — a doom-loop
+            elif repeat_cmd:
+                stalled += 1  # re-running work already done — a doom-loop
             elif novel:
-                pass  # new evidence this turn — not a stall
+                pass  # new command and new evidence — genuine exploration
             else:
                 stalled += 1  # ran a command but learned nothing new
-            last_signature = signature
 
         # unreachable
 

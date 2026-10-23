@@ -88,6 +88,54 @@ def test_policy_should_stop_on_stall():
     assert policy.should_stop(Budget(), 3, stall_limit=3) is True
 
 
+def test_cmd_fingerprint_collapses_superficial_variants():
+    from agent.domain.solver import _cmd_fingerprint
+
+    def fp(cmd):
+        return _cmd_fingerprint(ToolCall("execute", {"cmd": cmd}))
+
+    # cosmetic variants (flags, absolute path, trailing echo) collapse to one key
+    assert fp("cat flag.txt") == fp("cat -n flag.txt")
+    assert fp("cat flag.txt") == fp("cat /tmp/ws/flag.txt")
+    # genuinely different work keeps a different fingerprint
+    assert fp("ls -la") != fp("cat flag.txt")
+    assert fp("cat a.txt") != fp("cat b.txt")
+    # non-execute tools fingerprint by name
+    assert _cmd_fingerprint(ToolCall("submit_flag", {"flag": "x"})) == "submit_flag"
+
+
+async def test_doom_loop_of_repeated_commands_stalls(clock):
+    # A doom-loop hides behind superficial command variation: the model re-reads
+    # the same file with cosmetically different commands, and the environment
+    # returns fresh output each turn — so output-novelty alone never trips. The
+    # command-fingerprint stall must still stop it well before the turn budget.
+    ch = make_challenge("c1", n_questions=1)
+    platform = FakePlatform([ch], verdicts=VerdictStatus.WRONG)
+
+    n = {"i": 0}
+
+    def novel_each_time(_cmd):
+        n["i"] += 1
+        return ExecResult(stdout=f"unique-output-{n['i']}")  # always "novel"
+
+    variants = ["cat flag.txt", "cat -n flag.txt", "cat /tmp/ws/flag.txt"]
+    k = {"i": 0}
+
+    def loop(_messages):
+        cmd = variants[k["i"] % len(variants)]
+        k["i"] += 1
+        return LLMResponse(tool_calls=[ToolCall("execute", {"cmd": cmd})])
+
+    solver = ReActSolver(
+        FakeLLM(loop), FakeExecution(novel_each_time), platform, MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=50),
+    )
+    status = await solver.solve(ch)
+    assert status is RunStatus.GIVEN_UP
+    assert solver.turns < 50  # stall stopped it, not the turn budget
+    assert solver.turns <= 15  # ~ stall_limit (12) + a couple, not a 50-turn spin
+
+
 class RoutedPlatform(FakePlatform):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
