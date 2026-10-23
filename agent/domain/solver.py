@@ -105,19 +105,27 @@ def _find_candidates(text: str) -> list[str]:
 
 
 def _extract_plan(text: str) -> list[str]:
-    """Pull the model's own todo-plan lines (`[ ]`/`[x] ...`) to carry forward.
+    """Pull the model's own working plan to carry forward: the DIAGNOSIS lines
+    (`HYPOTHESIS:` / `RULED OUT:`) plus the todo lines (`[ ]`/`[x] ...`).
 
     The loop used to keep a static placeholder plan and never fed the model's
     updated plan back, so every turn's context looked identical and the model
     kept re-reconning instead of advancing. Carrying its plan forward is the
-    cheap half of giving the loop a memory.
+    cheap half of giving the loop a memory; carrying the hypothesis + ruled-out
+    set (not just a checklist) is the higher-ROI half (2026 CTF-agent work).
     """
     out: list[str] = []
     for line in (text or "").splitlines():
         s = line.strip()
-        if s[:3].lower() in ("[ ]", "[x]"):
+        upper = s.upper()
+        if (
+            s[:3].lower() in ("[ ]", "[x]")
+            or upper.startswith("HYPOTHESIS:")
+            or upper.startswith("RULED OUT:")
+            or upper.startswith("RULED-OUT:")
+        ):
             out.append(s)
-    return out[:8]
+    return out[:9]
 
 
 def _is_qa(question: Question, run_mode: RunMode) -> bool:
@@ -378,6 +386,9 @@ class ReActSolver:
         key = (challenge.category or "").strip().lower()
         if key == "web":
             return [
+                "HYPOTHESIS: unknown — first map the attack surface, then commit "
+                "to one vuln class",
+                "RULED OUT: (none yet)",
                 "[ ] enumerate: GET /, /robots.txt, /sitemap.xml; read HTML "
                 "comments, linked JS/source, error pages for hidden routes/params",
                 "[ ] map inputs: every id/param/path/POST field and where it "
@@ -389,7 +400,8 @@ class ReActSolver:
                 "[ ] once the flag appears in real output, submit_flag it",
             ]
         return [
-            "[ ] recon: understand the target and the question",
+            "HYPOTHESIS: unknown — recon the target and the question first",
+            "RULED OUT: (none yet)",
             "[ ] form one hypothesis and test it with a minimal probe",
             "[ ] retrieve the value the grader expects, then submit_flag",
         ]
