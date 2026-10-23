@@ -206,14 +206,25 @@ async def test_qa_rejection_never_counts_as_solved(clock, kind, verdict):
 
 
 @pytest.mark.parametrize("kind", ["react", "cli"])
-async def test_plain_nonflag_is_not_submitted_as_jeopardy(clock, kind):
+async def test_nonflag_submit_gate_depends_on_source(clock, kind):
+    # The brace `looks_like_flag` gate filters AUTO candidates (CLI-harness output,
+    # stdout scans) so we don't burn grader attempts on noise. But an EXPLICIT
+    # submit_flag tool call is the model's deliberate choice — bare-value answers
+    # (a slug, a hex id, a gated intermediate) are legitimate and must reach the
+    # grader, bounded only by the wrong-attempt cap. So react (explicit) submits a
+    # bare value; cli (auto-scanned CLI output) still gates it out.
     ch = make_challenge()
     platform = RoutedPlatform([ch], verdicts=VerdictStatus.CORRECT)
     solver = _solver(kind, clock, platform, budget=Budget(max_turns=1))
 
-    assert await solver.solve(ch) is RunStatus.GIVEN_UP
-    assert platform.submissions == []
-    assert solver.answers == {}
+    status = await solver.solve(ch)
+    if kind == "react":
+        assert status is RunStatus.SOLVED
+        assert platform.submissions == [("c1", "q1", "A")]
+    else:
+        assert status is RunStatus.GIVEN_UP
+        assert platform.submissions == []
+        assert solver.answers == {}
 
 
 @pytest.mark.parametrize("kind", ["react", "cli"])

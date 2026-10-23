@@ -397,7 +397,7 @@ class ReActSolver:
             if call.name == "submit_flag":
                 flag = str(call.arguments.get("flag", "")).strip()
                 qid = str(call.arguments.get("question_id", "")) or None
-                verified = await self._submit(challenge, flag, qid)
+                verified = await self._submit(challenge, flag, qid, explicit=True)
                 if _is_complete(challenge):
                     return self._final_status(challenge, RunStatus.SOLVED)
                 history.append((
@@ -570,19 +570,28 @@ class ReActSolver:
         return progressed
 
     async def _submit(
-        self, challenge: Challenge, answer: str, qid: str | None
+        self, challenge: Challenge, answer: str, qid: str | None,
+        *, explicit: bool = False,
     ) -> bool:
         """Submit one candidate; return True only on a grader-CORRECT Verdict.
 
         Honors the wrong-attempt caps (policy.WRONG_ATTEMPT_CAPS) and the paused
         session (sleep via ClockPort, then retry — ADR-0002 §7). Never raises for
         an ordinary verdict; a verified flag is also broadcast on the bus.
+
+        ``explicit`` marks a submission the MODEL deliberately chose (a submit_flag
+        tool call) vs an auto-scanned stdout candidate. The ``looks_like_flag``
+        brace gate only filters AUTO candidates (so we don't spam the grader with
+        every token); an explicit answer is trusted and sent as-is — many answers
+        are bare values (a slug, a hex id, a gated intermediate) that are not
+        ``word{...}`` shaped, and blocking them locally means a correct answer can
+        never reach the grader. The wrong-attempt cap still bounds abuse.
         """
         q = self._question_for(challenge, qid)
         if q is None or q.answered or not answer:
             return False
         is_qa = _is_qa(q, self.run_mode)
-        if not is_qa and not policy.looks_like_flag(answer):
+        if not is_qa and not explicit and not policy.looks_like_flag(answer):
             return False
 
         cap = policy.WRONG_ATTEMPT_CAPS.get(q.fmt or "static", 10)
