@@ -317,7 +317,10 @@ class ReActSolver:
             "[ ] form one hypothesis and test it with a minimal probe",
             "[ ] retrieve the value the grader expects, then submit_flag",
         ]
-        recent_obs = ""
+        # Seed turn 1 with the workspace contents + cwd so the model starts from
+        # the actual files instead of burning its first turns on pwd/ls/find
+        # orientation (observed: 2-3 wasted turns before it reads anything).
+        recent_obs = await self._initial_workspace_view(workdir)
         invalid_streak = 0
         stalled = 0
         seen_obs: set[str] = set()  # observation fingerprints: novelty = progress
@@ -474,6 +477,23 @@ class ReActSolver:
             return f"execution error: {e!r}", ""
         cwd = await self._current_cwd(workdir)
         return self._parse_observation(res, cwd), res.stdout
+
+    async def _initial_workspace_view(self, workdir: str | None) -> str:
+        """One cheap listing of the fresh workspace, fed into turn 1 so the model
+        starts from cwd + staged files instead of spending turns on pwd/ls/find.
+        Best-effort: any failure yields an empty seed."""
+        if workdir is None:
+            return ""
+        try:
+            res = await self.execution.run(
+                "pwd; echo '--- files ---'; ls -la; "
+                "find . -maxdepth 2 -type f 2>/dev/null | head -50",
+                timeout_s=15, workdir=workdir,
+            )
+        except Exception:
+            return ""
+        body = _tail(res.stdout).strip()
+        return "Workspace on start (untrusted data):\n" + body if body else ""
 
     async def _current_cwd(self, workdir: str | None) -> str:
         """Best-effort cwd of the PERSISTENT shell session (cheap extra `pwd`).
