@@ -503,6 +503,76 @@ def _stage_attachments(
     return staged
 
 
+_READY_WORDS = {"ready", "running", "up", "active", "available", "healthy"}
+
+
+def _stage_instance_attachments(
+    platform_url: str, token: str, challenge_id: str,
+    competition_id: str, work_root: str,
+) -> list[str]:
+    """Download a running INSTANCE's per-team files into the adapter ROOT.
+
+    Reverse / crypto / misc instance challenges keep the real artifact baked into
+    the running instance (``/instances/{id}/attachments``), not the challenge-level
+    attachments (which only carry a README). The real image-mode platform stages
+    these into /ctfy/work; dev solve-mode must mirror that so the agent can see the
+    file. Start (or reuse — start_instance is idempotent) the instance, wait until
+    ready, then download. Best-effort; never raises."""
+    import time
+
+    import httpx
+
+    base = platform_url.rstrip("/") + "/api/v1"
+    headers = {"Authorization": f"Bearer {token}"}
+    staged: list[str] = []
+    try:
+        with httpx.Client(timeout=30, headers=headers, follow_redirects=True) as c:
+            def mine() -> dict[str, Any] | None:
+                r = c.get(f"{base}/instances")
+                rows = r.json().get("items", []) if r.status_code == 200 else []
+                return next(
+                    (it for it in rows if it.get("challenge_id") == challenge_id), None
+                )
+
+            inst = mine()
+            if inst is None:
+                body: dict[str, Any] = {"challenge_id": challenge_id}
+                if competition_id:
+                    body["competition_id"] = competition_id
+                c.post(f"{base}/instances", json=body)
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                inst = mine()
+                if inst and str(inst.get("status", "")).lower() in _READY_WORDS:
+                    break
+                time.sleep(3)
+            if not inst:
+                return staged
+            iid = inst.get("id")
+            lst = c.get(f"{base}/instances/{iid}/attachments")
+            names: list[str] = []
+            if lst.status_code == 200:
+                data = lst.json()
+                rows = data if isinstance(data, list) else (
+                    data.get("files") or data.get("items")
+                    or data.get("attachments") or []
+                )
+                names = [
+                    a["name"] for a in rows
+                    if isinstance(a, dict) and isinstance(a.get("name"), str)
+                ]
+            for name in names:
+                safe = os.path.basename(name)
+                r = c.get(f"{base}/instances/{iid}/attachments/{name}")
+                if r.status_code == 200:
+                    with open(os.path.join(work_root, safe), "wb") as fh:
+                        fh.write(r.content)
+                    staged.append(safe)
+    except Exception:
+        pass
+    return staged
+
+
 def _detect_qa_only(platform_url: str, token: str, challenge_id: str) -> bool:
     """Read is_qa_only from the raw challenge (the domain model drops it). Dev
     helper to pick run_mode; best-effort, never raises."""
@@ -677,9 +747,17 @@ async def _run_solve(
         qa_only = _detect_qa_only(
             settings.platform_url, settings.token, challenge_id
         )
+        inst_staged: list[str] = []
+        if not qa_only:
+            # Instance challenges keep the real per-team artifact on the running
+            # instance, not in challenge attachments; mirror image-mode staging.
+            inst_staged = _stage_instance_attachments(
+                settings.platform_url, settings.token, challenge_id, cid, work_root
+            )
         solve_notes.append(
             f"targeted solve of {challenge_id}; staged attachments: "
-            f"{staged or 'none'}; qa_only={qa_only}"
+            f"{staged or 'none'}; instance attachments: {inst_staged or 'none'}; "
+            f"qa_only={qa_only}"
         )
 
     execution = CountingExecution(SubprocessAdapter(root=work_root))
