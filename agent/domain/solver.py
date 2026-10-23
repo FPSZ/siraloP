@@ -685,14 +685,18 @@ class ReActSolver:
         is_qa = _is_qa(q, self.run_mode)
         if not is_qa and not explicit and not policy.looks_like_flag(answer):
             return False
-        # Anti-spray: a flag not present in any real tool output is a guess. A
-        # grounded flag (seen verbatim in output) is always allowed; ungrounded
-        # guesses are allowed only up to _UNGROUNDED_CAP per question, then
-        # refused locally (no grader attempt spent) so the lane explores instead
-        # of spraying. QA answers (literal free-text) are exempt — they need not
-        # appear in command output.
+        # Anti-spray cap. The grounding exemption (seen verbatim in real output)
+        # applies ONLY to an EXPLICIT model submit — a value the model
+        # deliberately chose after reading it. Auto-scanned candidates are NOT
+        # exempt even though they are "in output" by construction: a web response
+        # is full of flag-shaped decoys/structural text, and exempting them let
+        # the auto-scanner spray 77-123 of them at the grader. So: explicit +
+        # seen-in-output → always allowed; everything else (auto-scan candidates,
+        # or ungrounded guesses) → at most _UNGROUNDED_CAP per question, then
+        # refused locally (no grader attempt spent). QA answers (literal
+        # free-text) are exempt — they need not appear in command output.
         if not is_qa:
-            grounded = bool(answer) and answer in self._seen_output
+            grounded = explicit and bool(answer) and answer in self._seen_output
             if not grounded:
                 n = self._ungrounded.get(q.id, 0)
                 if n >= _UNGROUNDED_CAP:

@@ -485,3 +485,19 @@ async def test_ungrounded_flag_guesses_are_capped(clock):
     # many turns tried, but only up to the cap actually reached the grader
     assert len(q1_submits) <= _UNGROUNDED_CAP
     assert solver.turns > _UNGROUNDED_CAP
+
+
+def test_looks_like_flag_rejects_structural_text():
+    # The auto-candidate-scanner filters through looks_like_flag; it must reject
+    # GraphQL/JSON/code fragments (which are `word{...}`-shaped) or a web recon
+    # dump sprays them at the grader as flags. Real flags still pass.
+    from agent.domain import policy
+
+    assert policy.looks_like_flag("FLAG{65dce48aff035dcebe7552ea20f07e66}")
+    assert policy.looks_like_flag("ctfy{a_b-c!x}")
+    assert policy.looks_like_flag("FLAG{archives-stack-just-keep-unzipping-7b2c19}")
+    # structural / code text that the loose `\{.+\}` used to accept:
+    assert not policy.looks_like_flag("query{ __typename }")        # spaces
+    assert not policy.looks_like_flag('siteConfig(key:"flag"){id}')  # quotes/parens
+    assert not policy.looks_like_flag("obj{a{b}}")                   # nested braces
+    assert not policy.looks_like_flag("f{a b}")                      # inner space

@@ -11,7 +11,13 @@ from agent.domain.state import Budget
 # Per-question wrong-attempt caps (CTFY-0002 §5.5 defaults).
 WRONG_ATTEMPT_CAPS = {"single": 3, "multi": 10, "static": 10, "seeded": 10, "judge": 10}
 
-_FLAG_RE = re.compile(r"^[A-Za-z0-9_]+\{.+\}$")
+# A flag is `prefix{body}` where the body is a single compact token: NO
+# whitespace, quotes, parentheses or nested braces. The old `\{.+\}` accepted any
+# `word{...}`, so on web challenges the auto-candidate-scanner matched GraphQL /
+# JSON / code fragments like `query{ __typename }` or `cfg(key:"flag"){...}` and
+# sprayed them at the grader (one run submitted 77-123 such non-flags). Real flags
+# (`FLAG{deadbeef}`, `ctfy{a_b-c}`) pass; structural text does not.
+_FLAG_RE = re.compile(r"^[A-Za-z0-9_]{1,32}\{[^\s{}'\"()]{1,256}\}$")
 
 
 def looks_like_flag(text: str, fmt: re.Pattern[str] = _FLAG_RE) -> bool:
