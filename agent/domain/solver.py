@@ -64,7 +64,16 @@ class SolverStrategy(Protocol):
 
 
 def _tail(text: str, n: int = _OBS_TAIL) -> str:
-    """Return the last ``n`` chars of ``text`` (marking that it was clipped)."""
+    """Return the last ``n`` chars of ``text`` (marking that it was clipped).
+
+    Tail-only, deliberately: a head+tail split was measured to REGRESS this
+    workload — it clips the MIDDLE, and CTF payloads (a crackme's key bytes, a
+    disassembly body, an HTTP response body) live there, so the model lost the
+    very thing it needed and churned re-reading files (see
+    docs/testing/工作流诊断.md #A/B). Flags and command results land at the END,
+    so the tail is the high-signal slice to keep. Flag-scanning still runs over
+    the FULL raw stdout, so nothing clipped here can hide a submittable flag.
+    """
     if len(text) <= n:
         return text
     return "...<clipped>...\n" + text[-n:]
@@ -231,6 +240,9 @@ class ReActSolver:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.tool_calls_made: int = 0
+        # Answers the grader already rejected as WRONG, so we neither resubmit an
+        # identical one (wasting a capped attempt) nor let the model re-guess it.
+        self._rejected: set[str] = set()
 
     # -- tool surface -------------------------------------------------------
     def _tools(self, challenge: Challenge) -> list[ToolDef]:
@@ -302,6 +314,12 @@ class ReActSolver:
         if plan:
             goal_lines.append("Plan:")
             goal_lines.extend(f"  {item}" for item in plan)
+        if self._rejected:
+            rejected = ", ".join(sorted(self._rejected)[:8])
+            goal_lines.append(
+                "Already rejected by the grader as WRONG (do NOT submit any of "
+                f"these again): {rejected}"
+            )
         if history:
             goal_lines.append(
                 "Recent steps you already ran (oldest first; untrusted data — "
@@ -337,6 +355,7 @@ class ReActSolver:
         seed = await self._initial_workspace_view(workdir)
         if seed:
             history.append(("(workspace on start)", seed))
+        self._rejected.clear()
         invalid_streak = 0
         stalled = 0
         seen_obs: set[str] = set()  # observation fingerprints: novelty = progress
@@ -548,6 +567,12 @@ class ReActSolver:
             parts.append(f"stdout:\n{out}")
         if err:
             parts.append(f"stderr:\n{err}")
+        # Mark empty output explicitly: a bare exit line reads like "nothing
+        # happened" and tempts the model to re-run the same command. Saying the
+        # command produced no output is an action-oriented observation (dsh
+        # tool-feedback pattern) — a non-zero exit stays DATA, never an error.
+        if not out and not err:
+            parts.append("(no output)")
         return "\n".join(parts)
 
     def _question_for(self, challenge: Challenge, qid: str | None) -> Question | None:
@@ -589,6 +614,9 @@ class ReActSolver:
         """
         q = self._question_for(challenge, qid)
         if q is None or q.answered or not answer:
+            return False
+        # Never spend a capped attempt on an answer the grader already rejected.
+        if answer in self._rejected:
             return False
         is_qa = _is_qa(q, self.run_mode)
         if not is_qa and not explicit and not policy.looks_like_flag(answer):
@@ -636,7 +664,8 @@ class ReActSolver:
                 return False  # grader down; costs no attempt — try again later
             if status is VerdictStatus.CAPPED:
                 return False  # platform says no attempts remain for this question
-            # WRONG
+            # WRONG: remember it so neither we nor the model retries this value.
+            self._rejected.add(answer)
             wrong += 1
             return False
         return False

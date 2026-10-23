@@ -249,6 +249,26 @@ class CountingLLM:
         if close is not None:
             await close()
 
+    def tool_call_hist(self) -> dict[str, int]:
+        """Per-tool-name frequency across turns, derived from self.actions.
+
+        Each action is ``name(preview)`` (possibly several joined by ' ; '), or
+        ``(no tool) ...`` for a text-only turn. We count the tool NAME (the token
+        before '('), so execute / submit_flag / no_tool are tallied separately —
+        the agent-tool analogue of api_calls_by_method (which is platform-side)."""
+        hist: dict[str, int] = {}
+        for entry in self.actions:
+            for part in entry.split(" ; "):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.startswith("(no tool)"):
+                    name = "no_tool"
+                else:
+                    name = part.split("(", 1)[0].strip() or "?"
+                hist[name] = hist.get(name, 0) + 1
+        return hist
+
 
 class CountingExecution:
     """包装 ExecutionPort：统计命令数、耗时、超时数、workspace 数。"""
@@ -1096,6 +1116,7 @@ def _assemble_record(
         },
         "model": {
             "model_calls": llm.calls,
+            "tool_calls_by_name": llm.tool_call_hist(),  # execute/submit_flag/no_tool 分项
             "lanes_launched": None,   # 需 coordinator 埋点
             "escalations": None,
             "racing_used": None,
@@ -1360,7 +1381,9 @@ def _render_console(record: dict[str, Any]) -> str:
                 f"capped={ve.get('capped')} ungraded={ve.get('ungraded')} "
                 f"paused={ve.get('paused')}"),
         ("预算", f"turns={bu.get('turns_used')} tokens={bu.get('tokens_total')} "
-                f"tool_calls={bu.get('tool_calls_made')} model_calls={mo.get('model_calls')}"),
+                f"tool_calls={bu.get('tool_calls_made')} "
+                f"{_fmt_cell(mo.get('tool_calls_by_name'))} "
+                f"model_calls={mo.get('model_calls')}"),
         ("平台", f"api={pl.get('api_calls_total')} {_fmt_cell(pl.get('api_calls_by_method'))} "
                 f"4xx={_fmt_cell(pl.get('http_4xx'))} 5xx={_fmt_cell(pl.get('http_5xx'))}"),
         ("计时", f"wall={_fmt_cell(ti.get('total_wall_s'))}s "
