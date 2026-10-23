@@ -455,3 +455,33 @@ async def test_rejected_answer_memory_is_scoped_per_question(clock):
     assert status is RunStatus.SOLVED
     # "A" was rejected for q1 but still accepted for q2 (not cross-contaminated).
     assert solver.answers == {"q1": "B", "q2": "A"}
+
+
+async def test_ungrounded_flag_guesses_are_capped(clock):
+    # Anti-spray: flags the model never saw in real tool output are guesses. A few
+    # are allowed per question, then further ungrounded submissions are refused
+    # locally (no grader attempt) so the lane stops spraying the grader.
+    from agent.domain.solver import _UNGROUNDED_CAP
+
+    ch = make_challenge("c1", n_questions=1)
+    platform = FakePlatform([ch], verdicts=VerdictStatus.WRONG)
+    n = {"i": 0}
+
+    def spray(_messages):
+        n["i"] += 1
+        # a DISTINCT ungrounded flag each turn (so per-answer dedup doesn't hide
+        # the spray); none appears in any execute output
+        return LLMResponse(
+            tool_calls=[ToolCall("submit_flag",
+                                 {"flag": f"ctfy{{g{n['i']}}}", "question_id": "q1"})]
+        )
+
+    solver = ReActSolver(
+        FakeLLM(spray), FakeExecution(), platform, MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=20),
+    )
+    await solver.solve(ch)
+    q1_submits = [s for s in platform.submissions if s[1] == "q1"]
+    # many turns tried, but only up to the cap actually reached the grader
+    assert len(q1_submits) <= _UNGROUNDED_CAP
+    assert solver.turns > _UNGROUNDED_CAP
