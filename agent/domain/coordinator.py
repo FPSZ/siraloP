@@ -206,8 +206,15 @@ class Coordinator:
             if budget.exhausted(now=self.clock.now()):
                 return None
             instance = await self.platform.start_instance(cid)
-        if not instance.ready or not instance.host:
-            raise RuntimeError(f"instance {instance.id!r} is not a reachable ready target")
+        if not instance.ready:
+            raise RuntimeError(
+                f"instance {instance.id!r} did not become ready "
+                f"(status={instance.status.value})"
+            )
+        # A ready instance need not expose a network host: reverse / crypto /
+        # misc challenges ship their work as staged attachments and keep the
+        # instance only for the dynamic flag + grading (services:[], host="").
+        # Requiring a host here wrongly rejected every attachment-only target.
         return instance
 
     async def _solve_one(

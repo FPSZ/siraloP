@@ -143,6 +143,28 @@ async def test_unavailable_instance_does_not_run_model_or_report_success(clock, 
     assert llm.calls == []
 
 
+async def test_ready_instance_without_host_runs_model(clock):
+    # Reverse / crypto / misc instances are ready but expose no network service
+    # (services:[], host=""); the challenge is the staged attachment. A ready
+    # host-less target must still run the model, not be rejected as unreachable.
+    challenge = make_challenge(difficulty="hard")
+
+    class HostlessPlatform(FakePlatform):
+        async def start_instance(self, cid):
+            return Instance(cid, host="", status=InstanceStatus.READY)
+
+    def respond(_messages):
+        return LLMResponse(tool_calls=[ToolCall("submit_flag", {"flag": "ctfy{attach}"})])
+
+    result = await Coordinator(
+        HostlessPlatform([challenge]), FakeLLM(respond), FakeExecution(),
+        RecordingResultSink(), clock=clock,
+    ).run()
+
+    assert result.fully_solved
+    assert result.answers == {"q1": "ctfy{attach}"}
+
+
 async def test_qa_uses_no_instance_even_without_select_metadata(clock):
     challenge = make_challenge(difficulty="hard")
 

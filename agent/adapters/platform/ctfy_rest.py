@@ -197,12 +197,25 @@ class CtfyRestAdapter:
             body["competition_id"] = self._competition_id
         # A paused competition is a wait inside this I/O adapter, not a
         # fabricated terminal instance. Keep the frozen Instance status truthful.
-        while True:
-            resp = await self._request("POST", "/instances", json=body)
-            pause_delay = self._instance_pause_delay(resp)
-            if pause_delay is None:
-                break
-            await self._clock.sleep(pause_delay)
+        try:
+            while True:
+                resp = await self._request("POST", "/instances", json=body)
+                pause_delay = self._instance_pause_delay(resp)
+                if pause_delay is None:
+                    break
+                await self._clock.sleep(pause_delay)
+        except TransientError:
+            # Honor the frozen contract's "Start (or return)": the platform
+            # allows ~1 live instance per team and 429s a *duplicate* create
+            # while ours is still STARTING/READY. The caller polls readiness by
+            # re-calling start_instance (per the port docstring), so a second
+            # create naturally collides — return the instance we already hold
+            # instead of hammering create and leaking it. If none is actually
+            # ours, the 429 is a genuine transient/quota failure: re-raise.
+            existing = await self._find_team_instance(cid)
+            if existing is not None:
+                return existing
+            raise
         self._checked(resp, "POST /instances")
         d = self._unwrap(self._json_dict(resp), "data", "instance", "result")
         inst = self._instance_from_detail(d, fallback_id=cid, resp=resp)
@@ -228,6 +241,34 @@ class CtfyRestAdapter:
         if not resp.is_success:
             return None
         return self._unwrap(self._json_dict(resp), "data", "instance", "result")
+
+    async def _find_team_instance(self, cid: str) -> Instance | None:
+        """Return this team's existing instance for ``cid`` (the "or return" half
+        of start_instance), enriched with real host/port, or None.
+
+        Never raises: a lookup that itself 429s / errors just yields None and the
+        original create failure stands. GET /instances lists the team's live
+        instances ({"items": [{id, challenge_id, status, ...}]}); the list rows
+        carry no service address, so fetch the authoritative detail for a match.
+        """
+        try:
+            resp = await self._request("GET", "/instances")
+        except TransientError:
+            return None
+        if not resp.is_success:
+            return None
+        data = self._json_dict(resp)
+        items = data.get("items")
+        if not isinstance(items, list):
+            items = self._unwrap(data, "data", "result").get("items", [])
+        for it in items if isinstance(items, list) else []:
+            if isinstance(it, dict) and it.get("challenge_id") == cid:
+                iid = it.get("id")
+                detail = await self._get_instance_detail(iid) if iid else None
+                return self._instance_from_detail(
+                    detail if detail is not None else it, fallback_id=iid or cid
+                )
+        return None
 
     def _instance_from_detail(
         self, d: dict[str, Any], *, fallback_id: str, resp: httpx.Response | None = None

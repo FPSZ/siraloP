@@ -12,6 +12,7 @@ import json
 import httpx
 import pytest
 
+from agent.adapters._resilience import TransientError
 from agent.adapters.platform.ctfy_rest import CtfyRestAdapter
 from agent.domain.state import InstanceStatus, VerdictStatus
 from agent.testing.fakes import FakeClock
@@ -302,6 +303,60 @@ async def test_start_instance_benchmark_vpn_service_is_raw_tcp():
     assert inst.host == "snt6orcpps3xfupeh.internal"
     assert inst.port == 9999
     assert inst.tls_sni is False  # raw tcp over the VPN, not TLS+SNI
+
+
+async def test_start_instance_returns_existing_on_duplicate_429():
+    # The port contract is "Start (or return)": the caller polls readiness by
+    # re-calling start_instance, so a second create collides with the instance we
+    # already hold and the platform 429s the duplicate. Rather than fail the solve
+    # (and orphan the instance it already made), the adapter looks our instance up
+    # for this challenge and returns it ready.
+    calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(f"{req.method} {req.url.path}")
+        if req.method == "POST":
+            return httpx.Response(429, json={"code": "rate_limited"})
+        if req.url.path == "/api/v1/instances":
+            return httpx.Response(
+                200,
+                json={"items": [
+                    {"id": "inst-7", "challenge_id": "SAMPLE-001", "status": "ready"}
+                ]},
+            )
+        assert req.url.path == "/api/v1/instances/inst-7"
+        return httpx.Response(
+            200,
+            json={
+                "id": "inst-7",
+                "status": "ready",
+                "services": [
+                    {"service_type": "tcp", "host": "inst-7.chal.ctfy.run",
+                     "port": 443, "access": "tls_sni", "label": "app"}
+                ],
+            },
+        )
+
+    inst = await _adapter(handler, FakeClock()).start_instance("SAMPLE-001")
+    assert inst.id == "inst-7"
+    assert inst.status is InstanceStatus.READY
+    assert inst.host == "inst-7.chal.ctfy.run"
+    # the duplicate create 429'd (retried to exhaustion), then "or return" won
+    assert calls.count("POST /api/v1/instances") == 4
+    assert "GET /api/v1/instances" in calls
+    assert "GET /api/v1/instances/inst-7" in calls
+
+
+async def test_start_instance_reraises_429_without_our_instance():
+    # A genuine quota/transient 429 with no instance of ours: the failure stands
+    # (don't silently swallow it — the caller must see the start failed).
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "POST":
+            return httpx.Response(429, json={"code": "rate_limited"})
+        return httpx.Response(200, json={"items": []})
+
+    with pytest.raises(TransientError):
+        await _adapter(handler, FakeClock()).start_instance("SAMPLE-001")
 
 
 @pytest.mark.parametrize("status", [403, 409, 423])
