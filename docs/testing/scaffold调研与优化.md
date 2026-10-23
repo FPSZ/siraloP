@@ -59,6 +59,30 @@
 7. **侦察进 plan 模板**：turn-0 按类别把通用攻击面扫描写进 plan（枚举端点/参数→源码/注释/JS 泄露→
    鉴权/会话→逐参数试 IDOR/注入/LFI·SSRF·`file://`/模板·反序列化），**保持系统提示词短**。
 
+## PentAGI（vxcontrol/pentagi）对照（2026-10-23）
+
+Anthropic 2025-11 威胁情报点名的开源攻击代理框架。重型多 agent 全杀伤链渗透系统
+（Go+React+Docker+Postgres/pgvector，可选 Neo4j；`Flow→Task→SubTask→Action`，
+Orchestrator 调度 13 个专职 agent）。面向真实多主机网络的完整杀伤链，CTF 到拿 flag 即止，
+**大部分 out of scope**。可移植项（ROI 高→低）：
+
+1. **保留错误的输出摘要**（直接升级我们的截断）：大输出压缩时**保留 error/路径/URL/命令**，
+   且只在压缩后更小才替换——对应 2026「解析非结构化 telemetry」瓶颈。我们已做"小输出留全"，
+   可再加一层字段保留式压缩（而非裸尾截）。
+2. **执行监控阈值（实战数字）**：同子任务重复 ≥5 次 / 总调用 ≥10 次即介入；连续 3 次无效
+   工具调用触发 Reflector；接近预算时"收尾"提醒。补我们的反乱猜/防循环。
+3. **plan 用 delta 编辑**：Generator 出 ≤7 步，Refiner 带理由 add/modify/remove/reorder；
+   **规划默认关**（难题才开，易题是开销）——与 2026「planner 难题是赢、易题是开销」一致。
+4. **显式 done/进度检查**：完成是显式信号而非"模型停了"。
+
+**不采纳**（防御型 CTF 引擎）：多 agent 全家桶、pgvector/Neo4j、外部 CVE 搜索（招 benchmark
+污染）；攻击基础设施一律不碰——C2 回连端口(28000–29999)、后渗透/持久化/横移、Metasploit、
+自动装任意工具。
+
+**两条验证**：①PentAGI 也不硬编码侦察 checklist（按角色组织）+ 2026 证实精简单 agent 在 CTF
+追平/胜多 agent → **我们精简 ReAct + 侦察进 plan 的方向对**；②PentAGI **无独立 flag 验证步**
+（完成即 `done`）——正是幻觉成功点；**我们新加的"有据提交+反乱猜"比它更稳，保留强化**。
+
 ## 单条最大矛盾点
 
 不是"极简上下文"本身（那被验证是对的），而是**每条观察的尾截断**——它正好丢掉 2026 认定的
