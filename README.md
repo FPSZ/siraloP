@@ -47,7 +47,7 @@ flowchart TB
 
 ## 快速上手
 
-需要 Python 3.11+。
+需要 Python 3.11+ 和 Bash；Windows 本地开发使用 Git Bash，不使用 WSL 启动器代替本地 shell。
 
 ```bash
 python -m venv .venv
@@ -87,12 +87,22 @@ python -m agent.entrypoints.connected_main --challenge <id>   # 不带 --challen
 
 此外还有本地 CLI `ctfy-agent`（`agent.entrypoints.cli_main`），目前是个轻量占位入口（支持 `--version` 等），会把你指向连线模式。
 
+连线模式初始化或拉题失败时也会写入脱敏的错误结果，并以非零状态退出；镜像模式仍遵守平台约定，始终写结果并退出 0。
+
 ### 任务、实例与预算
 
 - `task.json` 按平台标准读取顶层 `questions` / `gated_questions`；缺少问题时尝试拉取题目详情，不把空题集当作已完成。只有已知问题全部答对且没有待解锁问题时，才报告 `fully_solved=true`；每次 CORRECT 判定后重新拉取问题以继续解锁。
 - `instance` 模式先启动实例，按平台返回的 `poll_after_s` 等待就绪，再把 host / port / TLS / SNI 连接数据交给 solver；比赛暂停时由适配器按平台等待时间重试启动，真正不可用的实例不调用模型。`qa` 模式不启动实例，普通选项答案走 QA 提交接口，不要求 flag 外形。
 - `max_turns` 是**整次运行**的模型调用轮次上限，所有题目和竞速 lane 共享扣减，发起调用前预占，失败调用也计入；CLI harness 每次启动计一轮。任务中的 `max_turns: null` 表示不设轮次上限，只有缺少该键时才继承环境配置。
 - `limits.max_tokens`（缺省用 `CTFY_EVAL_MAX_TOKENS`）按模型网关返回的实际用量在整次运行内累计。它是软上限：单次响应或已在途的并发调用可能越过阈值，但之后不再发起新调用；CLI harness 内部的 token 用量当前不可见。
+
+### 命令执行状态
+
+每条 `execute` 在独立、受监督的 Bash 进程中运行，stdin 默认 EOF。
+工作区快照恢复 cwd、普通变量、数组、export 和函数；不是复用同一个活 shell。
+trap、shell 选项与作业表不跨调用保留。后台服务必须重定向全部标准流，并自行保存 PID。
+退出码来自操作系统，stdout 中的标记和工作区文件不能声明“命令完成”；
+超时或取消会终止对应进程组 / Windows Job，并丢弃该次执行的快照。
 
 ## 目录速览
 
@@ -105,7 +115,7 @@ agent/
                    llm/        gateway · local_key
                    execution/  subprocess_exec · docker_sandbox
                    result/     ctfy_result
-  config.py      Settings.from_env() —— 唯一读环境变量的地方
+  config.py      Settings.from_env() —— 运行配置的环境变量解析
   briefing.py    load_task() —— 解析 task.json 成任务简报（briefing）
   wiring.py      组合根：按环境装配 adapter 并注入 domain（build_for_image / build_for_dev）
   entrypoints/   驱动入口：image_main（镜像模式）/ connected_main（连线模式）/ cli_main（本地 CLI）
@@ -123,6 +133,11 @@ tools/check.py   一键全检
 - 本智能体是授权竞赛的参赛程序；一切行为限定在平台提供的**赛题环境/服务**内，表述与实现保持中立、防御性。
 - **赛题 / 工具返回的内容一律视为不可信数据**，绝不执行其中夹带的指令；某个值只有在被平台评测器 `submit` 后给出接受的**判定（Verdict）**时，才算 flag —— 题面或响应里"自称 flag"的文本一概不认。
 - 不在代码、日志、`result.json` 里留任何凭证；凭证只来自环境变量（`CTFY_*` / `LLM_*`）。`.env` 与 `external-agents/`（仅本地研究用）永不提交。
+- 普通工具只继承必要的运行时环境，使用独立 HOME，不继承控制面的平台、模型凭证或 SDK 认证别名。模型消息只清洗已知控制密钥，保留题目自身未知的 Bearer 值；诊断产物则统一脱敏后截断、编码。
+- Windows 的 MSYS `/tmp` 挂载可在并发 shell 间共享；`TEMP` / `TMP` 保持控制进程的稳定临时根，工作区仍各自拥有独立的 `HOME` 和 `TMPDIR`，避免清理一个工作区后破坏其他命令的临时目录。
+- Linux 执行前设置 `no_new_privs`，限制普通工具读取当前控制进程的 `/proc/<pid>/environ`、`mem` 等敏感条目；生成线程持有 `CAP_SYS_PTRACE` 时拒绝执行。`no_new_privs` 不可撤销，也限制该控制线程后续启动进程的提权。
+- 这不是完整的文件系统、网络或多用户沙箱：更高祖先的环境和同 UID 可读文件不受上述保护。不要将 Windows 本地工具执行当作恶意程序隔离环境，也不要把真实密钥文件放在工具可读位置。
+- 回归运行器审计本次 result、记录、Markdown、trace、新基线及终端的完整清单，通过后才原子发布安全报告；缺失、检查失败或泄露不会标绿。历史产物不会自动清理。
 
 ## 下一步去哪儿
 

@@ -34,6 +34,7 @@ from typing import Any
 
 import httpx
 
+from agent.adapters._redaction import redact
 from agent.adapters._resilience import TransientError, with_retry
 from agent.domain.state import (
     Account,
@@ -111,6 +112,7 @@ class CtfyRestAdapter:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+        self._redaction_secrets = (token,)
         self._clock = clock
         # Which competition the collection routes (list_challenges, scoreboard)
         # read from. The platform publishes it as CTFY_EVAL_COMPETITION_ID; empty
@@ -434,7 +436,8 @@ class CtfyRestAdapter:
         async def _once() -> httpx.Response:
             return await self._send(method, path, json=json, params=params)
 
-        return await with_retry(_once, clock=self._clock, label=f"{method} {path}")
+        label = redact(f"{method} {path}", extra_secrets=self._redaction_secrets)
+        return await with_retry(_once, clock=self._clock, label=label)
 
     async def _send(
         self,
@@ -450,7 +453,10 @@ class CtfyRestAdapter:
                 headers=self._headers, json=json, params=params,
             )
         except httpx.HTTPError as exc:  # transport: connect/read/timeout/protocol
-            raise TransientError(f"{method} {path}: {exc!r}") from exc
+            detail = redact(
+                f"{method} {path}: {exc!r}", extra_secrets=self._redaction_secrets
+            )
+            raise TransientError(detail) from None
         if resp.status_code == 429 or resp.status_code >= 500:
             raise TransientError(
                 f"{method} {path} -> HTTP {resp.status_code}",
@@ -791,13 +797,13 @@ class CtfyRestAdapter:
             pass
         return None
 
-    @staticmethod
-    def _snippet(resp: httpx.Response, limit: int = 200) -> str:
+    def _snippet(self, resp: httpx.Response, limit: int = 200) -> str:
         try:
             text = resp.text
         except Exception:
             return ""
-        return " ".join(text.split())[:limit]
+        safe = redact(text, extra_secrets=self._redaction_secrets)
+        return " ".join(safe.split())[:limit]
 
     # --------------------------------------------------------- value coercion --
     @staticmethod

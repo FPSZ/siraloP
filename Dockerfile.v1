@@ -14,7 +14,8 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY pyproject.toml /app/
 COPY agent /app/agent
-RUN pip install --no-cache-dir -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
+RUN test -x /bin/bash && \
+    pip install --no-cache-dir -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # The platform sets cwd=/ctfy/work, so invoke the module by name, never a path.
 ENTRYPOINT ["python", "-m", "agent.entrypoints.image_main"]

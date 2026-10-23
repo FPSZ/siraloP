@@ -1,7 +1,8 @@
 """Runtime configuration, read from environment (CTFY-0001 §1.1).
 
 No I/O beyond reading env vars. Both the platform (image mode) and local dev
-(.env) populate these. Keep this the ONLY place that reads os.environ.
+(.env) populate these. Runtime settings are parsed here; adapter security
+boundaries also inspect the environment to isolate tools and redact credentials.
 """
 from __future__ import annotations
 

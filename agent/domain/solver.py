@@ -606,9 +606,9 @@ class ReActSolver:
         return "Workspace on start (untrusted data):\n" + body if body else ""
 
     async def _current_cwd(self, workdir: str | None) -> str:
-        """Best-effort cwd of the PERSISTENT shell session (cheap extra `pwd`).
+        """Best-effort restored workspace cwd (one extra ``pwd``).
 
-        The shell keeps cwd across calls, so a `cd` in a prior command moved us;
+        The executor restores cwd across calls, so a previous ``cd`` is visible;
         surfacing it each turn lets the model self-correct relative-path errors
         (the `cannot find archive.zip` failure mode).
         """

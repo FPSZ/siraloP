@@ -4,6 +4,8 @@ Uses httpx.MockTransport — no real network.
 """
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -199,3 +201,54 @@ async def test_hard_4xx_raises_runtimeerror():
 def test_empty_key_raises_at_construction():
     with pytest.raises(RuntimeError):
         GatewayAdapter("https://gw.test", "", "anthropic", clock=FakeClock())
+
+
+@pytest.mark.parametrize("flavor", ["openai", "anthropic"])
+async def test_control_secrets_are_not_model_context(monkeypatch, flavor):
+    platform_token = 'p1-platform-"credential\\with-unicode-密钥'
+    gateway_key = "p1-gateway-credential-0123456789"
+    target_token = "Bearer challenge-session-0123456789"
+    monkeypatch.setenv("CTFY_TOKEN", platform_token)
+    messages = [
+        Msg("system", f"control key={gateway_key}"),
+        Msg("user", f"control token={platform_token}; target={target_token}"),
+    ]
+
+    def handler(req):
+        payload = json.loads(req.content)
+        if flavor == "anthropic":
+            assert req.headers["x-api-key"] == gateway_key
+            assert payload["system"] == "control key=***"
+            user_content = payload["messages"][0]["content"]
+        else:
+            assert req.headers["authorization"] == f"Bearer {gateway_key}"
+            assert payload["messages"][0]["content"] == "control key=***"
+            user_content = payload["messages"][1]["content"]
+        assert user_content == f"control token=***; target={target_token}"
+        return httpx.Response(200, json={"content": [], "choices": []})
+
+    gateway = GatewayAdapter(
+        "https://gw.test", gateway_key, flavor, clock=FakeClock(), client=_client(handler)
+    )
+    try:
+        await gateway.complete(messages, model="m")
+    finally:
+        await gateway.aclose()
+
+
+async def test_gateway_error_is_scrubbed_before_truncation():
+    key = "KEY_BOUNDARY_0123456789"
+
+    def handler(_req):
+        return httpx.Response(403, text="x" * 495 + key + " forbidden")
+
+    gateway = GatewayAdapter(
+        "https://gw.test", key, "openai", clock=FakeClock(), client=_client(handler)
+    )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await gateway.complete([Msg("user", "hello")], model="m")
+    finally:
+        await gateway.aclose()
+    assert "KEY_B" not in str(caught.value)
+    assert "***" in str(caught.value)

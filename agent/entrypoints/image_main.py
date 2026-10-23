@@ -23,6 +23,7 @@ from agent.briefing import load_task
 from agent.config import Settings
 from agent.domain.coordinator import Coordinator
 from agent.domain.state import RunResult, Task
+from agent.entrypoints._resources import close_ports
 from agent.wiring import build_for_image
 
 
@@ -42,6 +43,7 @@ async def _run() -> None:
         return
 
     result = RunResult(stop_reason="not_started")
+    wiring = None
     try:
         wiring = build_for_image(settings)
         coord = Coordinator(
@@ -57,7 +59,11 @@ async def _run() -> None:
     except BaseException as e:  # noqa: B036 - must never exit without a result
         result = RunResult(stop_reason=f"error: {type(e).__name__}: {e}")
     finally:
-        sink.write(result)
+        try:
+            if wiring is not None:
+                await close_ports(wiring.execution, wiring.llm, wiring.platform)
+        finally:
+            sink.write(result)
 
 
 def main() -> int:

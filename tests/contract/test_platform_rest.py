@@ -8,6 +8,7 @@ workflow brief / CTFY-0001 §1.2, §4). httpx.MockTransport only — no real net
 from __future__ import annotations
 
 import json
+import traceback
 
 import httpx
 import pytest
@@ -602,3 +603,37 @@ async def test_scoreboard_falls_back_to_configured_competition_id():
     # Empty argument -> the adapter's configured competition_id is used.
     sb = await _adapter(handler).scoreboard("")
     assert sb.entries[0].team == "Polaris"
+
+
+async def test_error_body_is_scrubbed_before_diagnostic_truncation():
+    token = "TOKEN_BOUNDARY_0123456789"
+
+    def handler(request):
+        assert request.headers["authorization"] == f"Bearer {token}"
+        return httpx.Response(403, text="x" * 195 + token + " forbidden")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = CtfyRestAdapter(
+            "https://platform.test", token, clock=FakeClock(), client=client
+        )
+        with pytest.raises(RuntimeError) as caught:
+            await adapter.get_challenge("c1")
+    assert "TOKEN" not in str(caught.value)
+    assert "***" in str(caught.value)
+
+
+async def test_transport_error_traceback_does_not_expose_constructor_token():
+    token = 'synthetic-platform-"credential\\0123456789'
+
+    def handler(request):
+        raise httpx.ReadTimeout("transport diagnostic " + token, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = CtfyRestAdapter(
+            "https://platform.test", token, clock=FakeClock(), client=client
+        )
+        with pytest.raises(TransientError) as caught:
+            await adapter.get_challenge("c1")
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert token not in rendered
+    assert "synthetic-platform-" not in rendered

@@ -32,7 +32,7 @@ RUN printf 'Types: deb\nURIs: https://mirrors.tuna.tsinghua.edu.cn/debian\nSuite
 
 # --- Tier: base + general (interpreters, build, file inspection, archives, net) -
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential gcc nasm git curl wget openssl ca-certificates \
+      bash build-essential gcc nasm git curl wget openssl ca-certificates \
       file binutils binutils-multiarch xxd bsdextrautils jq ripgrep \
       unzip 7zip zstd lz4 lzop cabextract squashfs-tools \
       netcat-openbsd socat \

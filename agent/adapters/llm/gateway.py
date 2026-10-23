@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from agent.adapters._redaction import redact
 from agent.adapters._resilience import TransientError, with_retry
 from agent.domain.state import LLMResponse, Msg, ToolCall, ToolDef
 from agent.ports.clock import ClockPort
@@ -140,7 +141,8 @@ class GatewayAdapter:
             try:
                 resp = await self._client.post(path, headers=headers, json=body)
             except httpx.TransportError as e:  # timeouts + network errors
-                raise TransientError(f"gateway transport error: {e}") from e
+                message = redact(str(e), extra_secrets=(self.api_key,))
+                raise TransientError(f"gateway transport error: {message}") from None
             status = resp.status_code
             if status == 429 or status >= 500:
                 raise TransientError(
@@ -149,12 +151,14 @@ class GatewayAdapter:
                 )
             if status >= 400:
                 # 401/403 (auth) and any other 4xx: a hard failure, never retried.
-                raise RuntimeError(f"gateway error {status}: {resp.text[:500]}")
+                detail = redact(resp.text, extra_secrets=(self.api_key,))[:500]
+                raise RuntimeError(f"gateway error {status}: {detail}")
             try:
                 data = resp.json()
             except ValueError as e:
                 # 2xx with a non-JSON body: likely a flaky proxy — worth a retry.
-                raise TransientError(f"gateway returned non-JSON body: {e}") from e
+                detail = redact(str(e), extra_secrets=(self.api_key,))
+                raise TransientError(f"gateway returned non-JSON body: {detail}") from None
             return parse(data)
 
         return await with_retry(_do, clock=self.clock, label=f"gateway:{self.flavor}")
@@ -176,14 +180,20 @@ class GatewayAdapter:
     ) -> dict[str, Any]:
         system_parts: list[str] = []
         conversation: list[dict[str, Any]] = []
+
+        def content(message: Msg) -> str:
+            return redact(
+                message.content, extra_secrets=(self.api_key,), redact_bearer=False
+            )
+
         for m in messages:
             if m.role == "system":
                 if m.content:
-                    system_parts.append(m.content)
+                    system_parts.append(content(m))
                 continue
             # anthropic knows only user/assistant; fold tool/other into user.
             role = "assistant" if m.role == "assistant" else "user"
-            conversation.append({"role": role, "content": m.content})
+            conversation.append({"role": role, "content": content(m)})
 
         body: dict[str, Any] = {
             "model": model,
@@ -243,7 +253,12 @@ class GatewayAdapter:
         tools: list[ToolDef] | None,
     ) -> dict[str, Any]:
         conversation = [
-            {"role": m.role if m.role in _OPENAI_ROLES else "user", "content": m.content}
+            {
+                "role": m.role if m.role in _OPENAI_ROLES else "user",
+                "content": redact(
+                    m.content, extra_secrets=(self.api_key,), redact_bearer=False
+                ),
+            }
             for m in messages
         ]
         body: dict[str, Any] = {

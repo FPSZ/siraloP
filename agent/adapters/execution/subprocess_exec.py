@@ -1,23 +1,15 @@
-"""SubprocessAdapter — ExecutionPort inside THIS container (image mode, no DinD).
+"""Supervised, bounded tool execution with per-workspace Bash state.
 
-Run tools as child processes; isolate challenges by working directory. Caps
-concurrency with a per-instance semaphore to respect the 8GiB/2CPU/512pid budget
-(ADR-0001 §3.6), and never lets a runaway command hang the loop: on timeout the
-whole process tree is killed and an ``ExecResult(timed_out=True)`` is returned.
-
-Cross-platform (dev = Windows, prod = Linux container):
-  * POSIX — spawn in a new session (``start_new_session=True``) so the shell and
-    its descendants share one process group, then ``os.killpg(.., SIGKILL)``.
-  * Windows — spawn with ``CREATE_NEW_PROCESS_GROUP`` and tear the tree down with
-    ``taskkill /F /T /PID`` (falling back to ``proc.kill()``).
-
-Implements ports.execution.ExecutionPort. All methods are async; blocking file
-I/O is offloaded to a thread so the event loop stays responsive.
+Each command has its own OS process lifecycle. Workspace snapshots restore shell
+data, never completion or exit status; stdin is EOF, not an engine control stream.
+This is process hygiene and cancellation, not a filesystem/network OS sandbox.
 """
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -26,14 +18,78 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from agent.adapters._redaction import _secret_matcher, redact
+from agent.adapters.execution._security import WindowsDirectory, WindowsJob, protect_controller
 from agent.domain.state import ExecResult
 
 IS_WINDOWS = os.name == "nt"
 
-# How long to wait, after a kill, for the dying tree's buffered output to drain
-# and the process to be reaped. The tree is already SIGKILL'd, so this is a
-# safety net against a stuck pipe, not a normal wait.
 _REAP_TIMEOUT_S = 5.0
+_CREDENTIAL_NAMES = (
+    "CTFY_TOKEN", "LLM_API_KEY", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+)
+
+
+def _bash_path(override: str | None) -> str:
+    if override:
+        return override
+    if IS_WINDOWS:
+        # System32/bash.exe is the WSL launcher, not a local POSIX shell.
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            candidate = os.path.join(base, "Git", "bin", "bash.exe")
+            if os.path.isfile(candidate):
+                return candidate
+        for entry in os.get_exec_path():
+            if {"windows", "windowsapps"} & set(entry.lower().replace("\\", "/").split("/")):
+                continue
+            candidate = os.path.join(entry, "bash.exe")
+            if os.path.isfile(candidate):
+                return candidate
+    else:
+        discovered = shutil.which("bash")
+        if discovered:
+            return discovered
+    raise RuntimeError("Broken execution environment: a local Bash installation is required")
+
+
+def _tool_environment(home: str, shell: str) -> dict[str, str]:
+    """Allow essential tool discovery/OS plumbing, not control-plane settings."""
+    allowed = (
+        "PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
+        "SYSTEMDRIVE", "NUMBER_OF_PROCESSORS", "SSL_CERT_FILE",
+        "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    )
+    env = {name: os.environ[name] for name in allowed if name in os.environ}
+    tool_paths = [str(Path(shell).parent)]
+    if IS_WINDOWS:
+        git_tools = Path(shell).parent.parent / "usr" / "bin"
+        if git_tools.is_dir():
+            tool_paths.append(str(git_tools))
+    env["PATH"] = os.pathsep.join([*tool_paths, env.get("PATH", os.defpath)])
+    temp = os.path.join(home, "tmp")
+    config = os.path.join(home, "config")
+    os.makedirs(temp, exist_ok=True)
+    os.makedirs(config, exist_ok=True)
+    # MSYS shares /tmp mounts between concurrent shells. Its native TEMP/TMP
+    # root must outlive individual workspaces; TMPDIR remains workspace-private.
+    runtime_temp = tempfile.gettempdir() if IS_WINDOWS else temp
+    env.update({
+        "HOME": home, "USERPROFILE": home,
+        "APPDATA": config, "LOCALAPPDATA": os.path.join(home, "cache"),
+        "TMP": runtime_temp, "TEMP": runtime_temp, "TMPDIR": temp,
+        "XDG_CONFIG_HOME": config, "XDG_CACHE_HOME": os.path.join(home, "cache"),
+        "XDG_DATA_HOME": os.path.join(home, "data"), "LC_ALL": "C.UTF-8",
+        "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
+        "PAGER": "cat", "GIT_PAGER": "cat", "MANPAGER": "cat",
+        "SYSTEMD_PAGER": "cat", "LESS": "-F", "NO_COLOR": "1", "CLICOLOR": "0",
+        "PWNLIB_NOTERM": "1", "PWNLIB_SILENT": "1",
+        "DEBIAN_FRONTEND": "noninteractive",
+        "PIP_NO_CACHE_DIR": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    })
+    return env
 
 
 class SubprocessAdapter:
@@ -47,44 +103,15 @@ class SubprocessAdapter:
         output_cap: int = 64000,
         posix_shell: str | None = None,
     ) -> None:
+        protect_controller()
         self._root = os.path.abspath(root) if root else tempfile.mkdtemp(prefix="chal-")
         os.makedirs(self._root, exist_ok=True)
-        # Prod is a Linux container whose /bin/sh honors POSIX syntax (`;` and `&&`
-        # chaining, ls/cat/unzip); the agent is prompted for that world. On Windows
-        # DEV, create_subprocess_shell would use cmd.exe, which does NOT treat `;`
-        # as a separator — the agent's chained commands then fail. Mirror prod by
-        # routing commands through a POSIX shell (bash/sh) when one is on PATH.
-        # `posix_shell` overrides detection ("" forces cmd.exe; a path forces that
-        # shell) for tests / explicit config. On real POSIX we leave it None and
-        # create_subprocess_shell already uses /bin/sh.
-        if posix_shell is not None:
-            self._posix_shell = posix_shell or None
-        elif IS_WINDOWS:
-            self._posix_shell = shutil.which("bash") or shutil.which("sh")
-        else:
-            self._posix_shell = None
-        # Per-instance (NOT module-global) gate on concurrently running commands.
-        # Created here; asyncio.Semaphore binds lazily to the running loop on
-        # first ``await`` (Python 3.10+), so construction outside a loop is fine.
+        self._session_argv = [_bash_path(posix_shell), "--norc", "--noprofile"]
         self._sem = asyncio.Semaphore(max_concurrency)
-        self._output_cap = output_cap
-        # Persistent shell sessions, one per working directory. The agent drives a
-        # STATEFUL shell: `cd`, env vars and shell functions persist across execute
-        # calls — matching how a terminal actually behaves. A stateless fresh shell
-        # per command makes multi-step work (extract an archive, THEN read a file
-        # inside it) fall apart, which is exactly how the agent used to get lost.
-        # Each racing lane gets its own workspace+session (see new_workspace), so
-        # lanes never share shell state.
+        self._output_cap = max(0, output_cap)
         self._sessions: dict[str, _ShellSession] = {}
         self._ws_counter = 0
         self._closed = False
-        # Session shell: the Windows POSIX shell when detected, else bash, else sh.
-        # Invoked non-interactively, reading commands from stdin.
-        shell = self._posix_shell or shutil.which("bash") or "/bin/sh"
-        argv = [shell]
-        if os.path.basename(shell).lower().startswith("bash"):
-            argv += ["--norc", "--noprofile"]
-        self._session_argv = argv
 
     # -- ExecutionPort ----------------------------------------------------
 
@@ -164,16 +191,20 @@ class SubprocessAdapter:
         await loop.run_in_executor(None, lambda: os.makedirs(cwd, exist_ok=True))
         session = self._sessions.get(cwd)
         if session is None:
-            session = _ShellSession(
-                self._session_argv, cwd, self._spawn_kwargs(), kill=self._kill_tree
-            )
+            try:
+                session = _ShellSession(
+                    self._session_argv, cwd, self._spawn_kwargs(), kill=self._kill_tree
+                )
+            except Exception as error:
+                return ExecResult(
+                    stdout="", stderr=redact(str(error), redact_bearer=False),
+                    exit_code=-1, timed_out=False,
+                )
             self._sessions[cwd] = session
         return await session.run(cmd, timeout_s, output_cap=self._output_cap)
 
     async def aclose(self) -> None:
-        """Terminate every persistent shell session (idempotent). A long-lived
-        adapter (dev harness) should call this; a one-shot process exit also tears
-        the child shells down via the kill flags."""
+        """Terminate active commands and any redirected background services."""
         self._closed = True
         sessions, self._sessions = self._sessions, {}
         for s in sessions.values():
@@ -186,7 +217,8 @@ class SubprocessAdapter:
     def _spawn_kwargs() -> dict[str, Any]:
         """Spawn options that make the child the head of its own killable group."""
         if sys.platform == "win32":
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            # CREATE_SUSPENDED: assign to a Job before any Bash startup/user code.
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000004}
         return {"start_new_session": True}
 
     async def _kill_tree(self, proc: asyncio.subprocess.Process) -> None:
@@ -196,12 +228,11 @@ class SubprocessAdapter:
             return
         if sys.platform == "win32":
             if not await self._taskkill(pid):
-                self._safe_kill(proc)  # fallback: at least kill the root
+                self._safe_kill(proc)
             return
         try:
-            # start_new_session made the shell a group leader (pgid == pid); one
-            # killpg reaches the shell and all its descendants.
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            # The group can outlive its shell (explicitly redirected services).
+            os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass  # already gone
         except Exception:
@@ -235,56 +266,15 @@ class SubprocessAdapter:
         except Exception:
             pass
 
-    async def _reap(
-        self, proc: asyncio.subprocess.Process
-    ) -> tuple[bytes, bytes]:
-        """After a kill, collect any buffered output and reap the process."""
-        try:
-            return await asyncio.wait_for(proc.communicate(), timeout=_REAP_TIMEOUT_S)
-        except TimeoutError:
-            self._safe_kill(proc)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_S)
-            except TimeoutError:
-                pass
-            return b"", b""
-        except Exception:
-            return b"", b""
-
-    @staticmethod
-    def _cap_combined(stdout: str, stderr: str, cap: int) -> tuple[str, str, bool]:
-        """Truncate so ``len(stdout) + len(stderr) <= cap``, keeping both streams.
-
-        A small stream is kept whole and the other gets the remaining budget; if
-        both exceed half the cap they split it evenly. Heads are kept (the start
-        of tool output is usually the high-signal part). Returns the possibly
-        trimmed pair plus whether anything was cut.
-        """
-        total = len(stdout) + len(stderr)
-        if total <= cap:
-            return stdout, stderr, False
-        half = cap // 2
-        if len(stdout) <= half:
-            return stdout, stderr[: cap - len(stdout)], True
-        if len(stderr) <= half:
-            return stdout[: cap - len(stderr)], stderr, True
-        return stdout[:half], stderr[: cap - half], True
 
 
 class _ShellSession:
-    """A persistent, single shell process for one working directory.
+    """Serialize commands while carrying only untrusted workspace shell data.
 
-    Commands run strictly in order (serialized by a lock); the shell keeps its
-    state — current directory, environment, shell functions — BETWEEN calls, so
-    the agent can `cd` into an extracted archive in one step and read a file in
-    it the next. stdout+stderr are merged (one ordered stream the agent reads).
-
-    Protocol: each command is written to the shell's stdin, followed by a line
-    that prints a unique random marker plus ``$?``. We read the merged stream up
-    to that marker — everything before it is the command's output; the digits
-    after it are the exit code. A command that hangs past ``timeout_s`` has its
-    whole process tree killed and the session dropped (state is lost, which is
-    acceptable for the exceptional timeout path); the next call starts fresh.
+    The command is sourced from its own file, never stdin. EXIT writes ordinary
+    Bash variables, exports, functions and cwd for the next invocation. Changing
+    that snapshot or the EXIT trap can change workspace state, but cannot make
+    the OS report that a still-running process has completed.
     """
 
     def __init__(
@@ -298,93 +288,277 @@ class _ShellSession:
         self._argv = argv
         self._cwd = cwd
         self._spawn_kwargs = spawn_kwargs
-        self._kill = kill  # adapter._kill_tree(proc) — kills the tree, cross-platform
-        self._proc: asyncio.subprocess.Process | None = None
+        self._kill = kill
         self._lock = asyncio.Lock()
-        self._marker = "__CTFY_" + os.urandom(8).hex() + "__"
+        self._storage = tempfile.TemporaryDirectory(prefix="shell-state-")
+        self._directory = Path(self._storage.name)
+        self._generation = 0
+        self._state = self._directory / "state-0.bash"
+        self._home = str(self._directory / "home")
+        self._env = _tool_environment(self._home, argv[0])
+        self._directory_fd: int | None = None
+        if sys.platform != "win32":
+            self._directory_fd = os.open(
+                self._directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        self._directory_lock = WindowsDirectory(str(self._directory)) if IS_WINDOWS else None
+        self._groups: list[asyncio.subprocess.Process] = []
+        self._jobs: list[WindowsJob] = []
+        self._closed = False
 
-    async def _ensure(self) -> None:
-        if self._proc is not None and self._proc.returncode is None:
-            return
-        self._proc = await asyncio.create_subprocess_exec(
-            *self._argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=self._cwd,
-            **self._spawn_kwargs,
+    def _prepare_command(self, cmd: str) -> tuple[str, int]:
+        """Create once through a pinned directory, then use the creating handle."""
+        name = "command-" + os.urandom(16).hex() + ".bash"
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if sys.platform == "win32":
+            flags |= os.O_BINARY
+            descriptor = os.open(self._directory / name, flags, 0o600)
+        else:
+            flags |= os.O_NOFOLLOW
+            descriptor = os.open(name, flags, 0o600, dir_fd=self._directory_fd)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write((cmd + "\n").encode("utf-8"))
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if not IS_WINDOWS:
+                # Source the inherited file descriptor, not a replaceable path.
+                # Unlinking also prevents a later command from poisoning it.
+                os.unlink(name, dir_fd=self._directory_fd)
+                return f"/dev/fd/{descriptor}", descriptor
+            # The open CRT descriptor denies deletion; the directory handle
+            # prevents parent replacement. Keep it open until the command ends.
+            return (self._directory / name).as_posix(), descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _script(self, command: str) -> str:
+        state = shlex.quote(self._state.as_posix())
+        command_path = shlex.quote(command)
+        trap_command = shlex.quote(
+            f'_siralo_status=$?; _siralo_snapshot > {state}; builtin exit "$_siralo_status"'
         )
+        return f"""
+if builtin test -f {state}; then builtin source {state}; fi
+_siralo_snapshot() {{
+    builtin printf 'builtin cd -- %q\\n' "$(builtin pwd -P)"
+    while IFS= builtin read -r _siralo_decl; do
+        _siralo_flags=${{_siralo_decl#declare -}}
+        _siralo_flags=${{_siralo_flags%% *}}
+        case "$_siralo_flags" in *r*) continue ;; esac
+        _siralo_name=${{_siralo_decl#declare }}
+        _siralo_name=${{_siralo_name#* }}
+        _siralo_name=${{_siralo_name%%=*}}
+        case "$_siralo_name" in
+            _siralo_*|BASH*|EUID|UID|PPID|SHELLOPTS|BASHPID|FUNCNAME|GROUPS) continue ;;
+            DIRSTACK|PIPESTATUS|LINENO|OPTIND|OPTARG|RANDOM|SRANDOM|SECONDS) continue ;;
+            EPOCH*|SHLVL|_|PWD|OLDPWD) continue ;;
+        esac
+        builtin printf '%s\\n' "$_siralo_decl"
+    done < <(builtin declare -p)
+    while IFS= builtin read -r _siralo_name; do
+        case "$_siralo_name" in _siralo_*) continue ;; esac
+        builtin declare -f "$_siralo_name"
+    done < <(builtin compgen -A function)
+}}
+builtin trap {trap_command} EXIT
+builtin source {command_path}
+"""
+
+    def _prune_completed_groups(self) -> None:
+        live = []
+        for proc in self._groups:
+            try:
+                if sys.platform != "win32":
+                    os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+            live.append(proc)
+        self._groups = live
+        for job in self._jobs[:]:
+            if not job.active():
+                job.close()
+                self._jobs.remove(job)
 
     async def run(self, cmd: str, timeout_s: int, *, output_cap: int) -> ExecResult:
         async with self._lock:
-            try:
-                await self._ensure()
-            except Exception:
+            if self._closed:
                 return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=False)
-            proc = self._proc
-            assert proc is not None and proc.stdin is not None
-            payload = (
-                cmd + "\n" + f"printf '%s%d\\n' '{self._marker}' \"$?\"\n"
-            ).encode("utf-8", "replace")
+            secrets = tuple(os.environ[name] for name in _CREDENTIAL_NAMES if os.environ.get(name))
+            matcher, max_span = _secret_matcher(extra_secrets=secrets)
+            # Keep only a possible credential suffix plus the bounded, already
+            # redacted head. Redacting after a raw-byte cap would leak partial
+            # credentials when repeated replacements shrink the retained prefix.
+            lookahead = max(0, max_span - 1)
+            captured: list[str] = []
+            captured_length = 0
+            pending = ""
+            discarded = False
+            proc: asyncio.subprocess.Process | None = None
+            job: WindowsJob | None = None
+
+            def emit(text: str) -> None:
+                nonlocal captured_length, discarded
+                clean = redact(text, extra_secrets=secrets, redact_bearer=False)
+                remaining = output_cap - captured_length
+                head = clean[:remaining]
+                if head:
+                    captured.append(head)
+                    captured_length += len(head)
+                discarded |= len(clean) > remaining
+
+            def consume(text: str, *, final: bool = False) -> None:
+                nonlocal pending, discarded
+                if captured_length >= output_cap:
+                    discarded |= bool(text or pending)
+                    pending = ""
+                    return
+                pending += text
+                while pending:
+                    safe_length = len(pending) if final else max(0, len(pending) - lookahead)
+                    if not safe_length:
+                        break
+                    # Consume a complete earliest credential if it crosses the
+                    # safe prefix boundary; never feed half a known key to redact.
+                    match = matcher.search(pending) if matcher is not None else None
+                    boundary = (
+                        match.end()
+                        if match is not None and match.start() < safe_length else safe_length
+                    )
+                    emit(pending[:boundary])
+                    pending = pending[boundary:]
+                    if captured_length >= output_cap:
+                        discarded |= bool(pending)
+                        pending = ""
+                        break
+
+            async def drain() -> None:
+                assert proc is not None and proc.stdout is not None
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                while chunk := await proc.stdout.read(4096):
+                    consume(decoder.decode(chunk))
+                consume(decoder.decode(b"", final=True), final=True)
+
+            async def finish() -> int:
+                assert proc is not None
+                await drain()
+                return await proc.wait()
+
+            collector: asyncio.Task[int] | None = None
+            spawn: asyncio.Task[asyncio.subprocess.Process] | None = None
+            command_fd: int | None = None
             try:
-                proc.stdin.write(payload)
-                await proc.stdin.drain()
-            except Exception:
-                await self._discard(proc)
-                return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=False)
-            try:
-                out, code, died = await asyncio.wait_for(
-                    self._read_until(proc), timeout_s
-                )
+                # Reapply in the actual spawning thread: capability and
+                # no_new_privs state are thread-scoped on Linux.
+                protect_controller()
+                command, command_fd = self._prepare_command(cmd)
+                spawn_kwargs = dict(self._spawn_kwargs)
+                if not IS_WINDOWS:
+                    spawn_kwargs["pass_fds"] = (command_fd,)
+                if IS_WINDOWS:
+                    job = WindowsJob()
+                spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+                    *self._argv, "-c", self._script(command),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=self._cwd, env=self._env, limit=8192,
+                    **spawn_kwargs,
+                ))
+                # Cancellation during process creation must still acquire and
+                # tear down the process, rather than orphan it before assignment.
+                proc = await asyncio.shield(spawn)
+                if not IS_WINDOWS:
+                    self._groups.append(proc)
+                if job is not None:
+                    job.assign(proc.pid)
+                    self._jobs.append(job)
+                    job.resume(proc.pid)
+                collector = asyncio.create_task(finish())
+                code = await asyncio.wait_for(asyncio.shield(collector), timeout_s)
             except TimeoutError:
-                await self._discard(proc)  # command hung — drop the session
+                await self._discard(proc, job, collector)
                 return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
-            if died:
-                await self._discard(proc)
-            truncated = len(out) > output_cap
-            if truncated:
-                out = out[:output_cap]
+            except asyncio.CancelledError:
+                if proc is None and spawn is not None:
+                    try:
+                        proc = await spawn
+                    except Exception:
+                        pass
+                await self._discard(proc, job, collector)
+                raise
+            except Exception as error:
+                await self._discard(proc, job, collector)
+                return ExecResult(
+                    stdout="",
+                    stderr=redact(str(error), extra_secrets=secrets, redact_bearer=False),
+                    exit_code=-1,
+                    timed_out=False,
+                )
+            finally:
+                if command_fd is not None:
+                    os.close(command_fd)
+            self._prune_completed_groups()
             return ExecResult(
-                stdout=out, stderr="", exit_code=code,
-                timed_out=False, truncated=truncated,
+                stdout="".join(captured), stderr="", exit_code=code,
+                timed_out=False, truncated=discarded,
             )
 
-    async def _read_until(self, proc: asyncio.subprocess.Process) -> tuple[str, int, bool]:
-        """Read the merged stream until the marker; return (output, exit_code, died)."""
-        assert proc.stdout is not None
-        mbytes = self._marker.encode()
-        buf = bytearray()
-        while True:
-            chunk = await proc.stdout.read(4096)
-            if not chunk:  # EOF: the shell exited (e.g. the command ran `exit`)
-                return buf.decode("utf-8", "replace"), -1, True
-            buf += chunk
-            idx = buf.find(mbytes)
-            if idx == -1:
-                continue
-            nl = buf.find(b"\n", idx)
-            if nl == -1:
-                continue  # marker seen but need the full exit-code line
-            try:
-                code = int(buf[idx + len(mbytes):nl])
-            except ValueError:
-                code = -1
-            return bytes(buf[:idx]).decode("utf-8", "replace"), code, False
-
-    async def _discard(self, proc: asyncio.subprocess.Process) -> None:
-        self._proc = None
-        try:
-            if proc.stdin is not None and not proc.stdin.is_closing():
-                proc.stdin.close()
-        except Exception:
-            pass
-        try:
+    async def _discard(
+        self,
+        proc: asyncio.subprocess.Process | None,
+        job: WindowsJob | None,
+        collector: asyncio.Task[int] | None,
+    ) -> None:
+        # Invalidate by switching paths, not by trusting or modifying a possibly
+        # attacker-replaced snapshot. Cleanup must never depend on its contents.
+        self._generation += 1
+        self._state = self._directory / f"state-{self._generation}.bash"
+        if job is not None:
+            job.close()
+            if job in self._jobs:
+                self._jobs.remove(job)
+        if proc is not None:
             await self._kill(proc)
-        except Exception:
-            pass
+            if proc in self._groups:
+                self._groups.remove(proc)
+            if collector is None:
+                async def reap() -> int:
+                    assert proc.stdout is not None
+                    while await proc.stdout.read(4096):
+                        pass
+                    return await proc.wait()
+                collector = asyncio.create_task(reap())
+        if collector is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(collector), _REAP_TIMEOUT_S)
+            except (Exception, asyncio.CancelledError):
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
+        if proc is not None:
+            try:
+                await asyncio.wait_for(proc.wait(), _REAP_TIMEOUT_S)
+            except TimeoutError:
+                pass
 
     async def aclose(self) -> None:
         async with self._lock:
-            proc, self._proc = self._proc, None
-            if proc is not None and proc.returncode is None:
-                await self._discard(proc)
+            self._closed = True
+            for job in self._jobs:
+                job.close()
+            self._jobs.clear()
+            for proc in self._groups:
+                await self._kill(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), _REAP_TIMEOUT_S)
+                except TimeoutError:
+                    pass
+            self._groups.clear()
+            if self._directory_lock is not None:
+                self._directory_lock.close()
+            if self._directory_fd is not None:
+                os.close(self._directory_fd)
+                self._directory_fd = None
+            self._storage.cleanup()

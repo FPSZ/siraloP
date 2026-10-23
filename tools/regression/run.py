@@ -29,13 +29,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 import platform as _platform
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +53,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import agent  # noqa: E402
+from agent.adapters._redaction import RedactionError, contains_secret, redact, redact_data  # noqa: E402
 from agent.domain.state import (  # noqa: E402
     Account,
     Challenge,
@@ -64,6 +68,7 @@ from agent.domain.state import (  # noqa: E402
     Verdict,
     VerdictStatus,
 )
+from agent.entrypoints._resources import close_ports  # noqa: E402
 
 # ===========================================================================
 # 非侵入埋点：Counting* 包装器（结构实现各端口，委托给真实/假适配器）
@@ -230,17 +235,19 @@ class CountingLLM:
         self.input_tokens += getattr(resp, "input_tokens", 0) or 0
         self.output_tokens += getattr(resp, "output_tokens", 0) or 0
         if getattr(resp, "stop_reason", ""):
-            self.stop_reasons.append(resp.stop_reason)
+            self.stop_reasons.append(redact(resp.stop_reason))
         calls = getattr(resp, "tool_calls", None) or []
         if calls:
             previews = []
             for tc in calls:
                 args = getattr(tc, "arguments", {}) or {}
                 arg = args.get("cmd") or args.get("answer") or args.get("flag") or ""
-                previews.append(f"{getattr(tc, 'name', '?')}({str(arg)[:120]})")
+                previews.append(
+                    f"{redact(str(getattr(tc, 'name', '?')))}({str(redact_data(arg))[:120]})"
+                )
             self.actions.append(" ; ".join(previews))
         else:
-            text = (getattr(resp, "text", "") or "").strip().replace("\n", " ")
+            text = redact(getattr(resp, "text", "") or "").strip().replace("\n", " ")
             self.actions.append(f"(no tool) {text[:120]}")
         return resp
 
@@ -290,14 +297,16 @@ class CountingExecution:
         except Exception as e:  # noqa: BLE001
             self.exceptions.append(type(e).__name__)
             self.durations.append(time.perf_counter() - start)
-            self.transcript.append({"cmd": cmd[:300], "error": type(e).__name__})
+            self.transcript.append({"cmd": redact(cmd)[:300], "error": redact(type(e).__name__)})
             raise
         self.durations.append(time.perf_counter() - start)
         if getattr(res, "timed_out", False):
             self.timeouts += 1
-        tail = ((getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")).strip()
+        tail = redact(
+            (getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")
+        ).strip()
         self.transcript.append({
-            "cmd": cmd[:300],
+            "cmd": redact(cmd)[:300],
             "exit": getattr(res, "exit_code", None),
             "timed_out": getattr(res, "timed_out", False),
             "tail": tail[-240:],
@@ -809,16 +818,10 @@ async def _run_solve(
         notes.append(f"solve error: {type(e).__name__}: {e}")
         result = RunResult(stop_reason=f"error: {type(e).__name__}")
     finally:
-        sink.write(result)
         try:
-            await execution.aclose()  # tear down persistent shell sessions
-        except Exception:
-            pass
-        for c in (plat_client, gw_client):
-            try:
-                await c.aclose()
-            except Exception:
-                pass
+            await close_ports(execution, plat_client, gw_client)
+        finally:
+            sink.write(result)
 
     # 竞赛暂停：若出现 PAUSED 判定，在记录里标注（不视为错误）。
     paused = platform.verdict_counts().get(VerdictStatus.PAUSED.value, 0)
@@ -886,13 +889,52 @@ def _host_only(url: str) -> str:
     return netloc.rsplit("@", 1)[-1] if "@" in netloc else netloc
 
 
-def _scan_secret_leak(result_text: str) -> bool:
-    """True 表示未泄露。扫描 result.json 文本是否含已知密钥明文。"""
-    for name in ("LLM_API_KEY", "CTFY_TOKEN"):
-        secret = os.environ.get(name) or ""
-        if len(secret) >= 8 and not secret.isspace() and secret in result_text:
+def _audit_outputs(
+    paths: list[str], *, stdout: str, stderr: str, json_paths: tuple[str, ...] = (),
+) -> bool:
+    """Audit an explicit manifest and the exact staged terminal output.
+
+    Do not glob a directory: old runs are not this run, and an absent expected
+    artifact must fail rather than disappear from the scan. Decode JSON before
+    inspecting keys/values. No filename is concatenated with its contents.
+    """
+    try:
+        if not paths or contains_secret(stdout) or contains_secret(stderr):
             return False
-    return True
+        for path in paths:
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
+            if not text:
+                return False
+            value = (
+                json.loads(text) if path in json_paths or path.lower().endswith(".json")
+                else text
+            )
+            if contains_secret(value) or contains_secret(text):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _redact_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Preserve the fixed report schema, scrubbing every data-bearing value.
+
+    A one-character credential must not rename fixed fields such as ``meta``.
+    Dynamic dictionaries inside field values still have their keys scrubbed.
+    """
+    cleaned: dict[str, Any] = {}
+    for group, value in record.items():
+        if group == "per_challenge":
+            cleaned[group] = [
+                {field: redact_data(item) for field, item in row.items()}
+                for row in value
+            ]
+        elif isinstance(value, dict):
+            cleaned[group] = {field: redact_data(item) for field, item in value.items()}
+        else:
+            cleaned[group] = redact_data(value)
+    return cleaned
 
 
 def _assemble_record(
@@ -941,7 +983,8 @@ def _assemble_record(
             answers_solved_consistent = all(q in ans for q in (data.get("solved", []) or []))
         except Exception as e:  # noqa: BLE001
             notes.append(f"result.json parse error: {type(e).__name__}: {e}")
-    no_secret_leak = _scan_secret_leak(result_text) if result_text else True
+    # Only main's final, explicit-manifest audit may set this true.
+    no_secret_leak = False
 
     # --- solving：按 qid→challenge 聚合 --------------------------------------
     solved_qids = list(result.solved)
@@ -1168,7 +1211,7 @@ def _assemble_record(
         "per_challenge": per_challenge,
         "_notes": notes,
     }
-    return record
+    return _redact_record(record)
 
 
 # ===========================================================================
@@ -1254,13 +1297,13 @@ def _print_comparison(
 ) -> None:
     print("\n=== 回归比对（与基线） ===")
     if base_mode and base_mode != cur_mode:
-        print(f"  ! 基线档位({base_mode}) 与本次({cur_mode}) 不一致——比对仅供参考。")
+        print(redact(f"  ! 基线档位({base_mode}) 与本次({cur_mode}) 不一致——比对仅供参考。"))
     for r in rows:
         mark = {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL", "SKIP": "skip"}[r["level"]]
         line = f"  [{mark}] {r['metric']}: 本次={r['current']} 基线={r['baseline']}"
         if r.get("detail"):
             line += f"  ({r['detail']})"
-        print(line)
+        print(redact(line))
     print(f"=== 总判定: {overall} ===")
 
 
@@ -1298,6 +1341,7 @@ def _fmt_cell(v: Any) -> str:
 def _render_markdown(record: dict[str, Any]) -> str:
     """Full field table (every group + per_challenge) as Markdown — the record,
     rendered as the 表格 the field spec describes, one file per run."""
+    record = _redact_record(record)
     m = record.get("meta", {})
     so = record.get("solving", {})
     st = record.get("stability", {})
@@ -1345,8 +1389,8 @@ def _render_trace(probes: dict[str, Any]) -> str:
     so a reader can see exactly what the agent tried and why it stalled."""
     llm = probes.get("llm")
     ex = probes.get("execution")
-    actions = list(getattr(llm, "actions", []) or [])
-    transcript = list(getattr(ex, "transcript", []) or [])
+    actions = redact_data(list(getattr(llm, "actions", []) or []))
+    transcript = redact_data(list(getattr(ex, "transcript", []) or []))
     lines = ["===== AGENT 轨迹（逐轮）====="]
     n = max(len(actions), len(transcript))
     if n == 0:
@@ -1368,6 +1412,7 @@ def _render_trace(probes: dict[str, Any]) -> str:
 
 def _render_console(record: dict[str, Any]) -> str:
     """Compact aligned highlights for the terminal (full table goes to the .md)."""
+    record = _redact_record(record)
     g = record.get
     so, ve, bu, mo, pl, ti, st = (
         g("solving", {}), g("verdicts", {}), g("budget", {}), g("model", {}),
@@ -1426,6 +1471,89 @@ async def _dispatch(
     )
 
 
+def _render_outputs(
+    record: dict[str, Any], probes: dict[str, Any], args: argparse.Namespace,
+    *, record_path: str, table_path: str, trace_path: str, baseline_path: str,
+    baseline: dict[str, Any] | None, thresholds: dict[str, Any], dispatch_stdout: str,
+) -> tuple[dict[str, str], str]:
+    """Stage the exact final bytes, including comparison and path messages."""
+    payload = json.dumps(record, ensure_ascii=False, indent=2)
+    outputs = {record_path: payload, table_path: redact(_render_markdown(record))}
+    terminal = io.StringIO()
+    with contextlib.redirect_stdout(terminal):
+        if dispatch_stdout:
+            print(dispatch_stdout, end="")
+        print(f"[regression] 记录已写入: {redact(record_path)}")
+        print(f"[regression] 字段表格: {redact(table_path)}")
+        print(
+            f"[regression] 档位={args.mode} 解出={record['solving']['questions_solved']}"
+            f"/{record['solving']['questions_total']} "
+            f"stop_reason={record['stability']['stop_reason']}"
+        )
+        print(_render_console(record))
+        if args.trace:
+            trace = redact(_render_trace(probes))
+            outputs[trace_path] = trace
+            print(f"[regression] 轨迹已写入: {redact(trace_path)}")
+            print(trace)
+        if args.save_baseline:
+            outputs[baseline_path] = payload
+            print(f"[regression] 已另存基线: {redact(baseline_path)}")
+        elif baseline is not None:
+            overall, rows = _compare(record, baseline, thresholds)
+            _print_comparison(overall, redact_data(rows), _dget(baseline, "meta.mode"), args.mode)
+        else:
+            print(
+                f"[regression] 未找到基线 {redact(baseline_path)}"
+                " —— 用 --save-baseline 存一个基线。"
+            )
+    return outputs, redact(terminal.getvalue())
+
+
+def _write_outputs(outputs: dict[str, str]) -> None:
+    for path, text in outputs.items():
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+
+
+def _stage_candidates(outputs: dict[str, str]) -> dict[str, str]:
+    """Write unpublished bytes beside each destination for atomic promotion."""
+    candidates: dict[str, str] = {}
+    try:
+        for path, text in outputs.items():
+            fd, temporary = tempfile.mkstemp(
+                prefix=".regression-", suffix=".tmp", dir=os.path.dirname(path) or ".",
+            )
+            candidates[path] = temporary
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+        return candidates
+    except BaseException:
+        _discard_candidates(candidates)
+        raise
+
+
+def _discard_candidates(candidates: dict[str, str]) -> None:
+    for path in candidates.values():
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _publish_candidates(candidates: dict[str, str], *, record_path: str) -> None:
+    # The record is the commit marker. Never expose its green metric until all
+    # other audited candidate bytes have been atomically promoted.
+    for path, temporary in candidates.items():
+        if path != record_path:
+            os.replace(temporary, path)
+    os.replace(candidates[record_path], record_path)
+
+
+
 def main() -> int:
     global _GIT_COMMIT, _GIT_DIRTY
     p = argparse.ArgumentParser(description="ctfy-agent 回归测试运行器")
@@ -1443,12 +1571,23 @@ def main() -> int:
                    help="solve 档每题轮次上限（dev 兜底，防止一道题跑太久）")
     p.add_argument("--trace", action="store_true",
                    help="打印并保存 agent 的逐轮动作 + 命令结果（看它到底做了什么）")
-    args = p.parse_args()
+    cli_stdout, cli_stderr = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(cli_stdout), contextlib.redirect_stderr(cli_stderr):
+            args = p.parse_args()
+    except SystemExit as error:
+        print(redact(cli_stdout.getvalue()), end="")
+        print(redact(cli_stderr.getvalue()), end="", file=sys.stderr)
+        return error.code if isinstance(error.code, int) else 1
 
     _GIT_COMMIT, _GIT_DIRTY = _git_info()
     out_dir = args.out or os.path.join(_REPO_ROOT, "regression", "runs")
     baseline_path = args.baseline or os.path.join(_REPO_ROOT, "regression", "baseline.json")
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as error:
+        print(redact(f"[regression] 输出目录不可写: {error}"), file=sys.stderr)
+        return 1
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + _GIT_COMMIT
     result_path = os.path.join(out_dir, f"result-{run_id}.json")
@@ -1459,73 +1598,138 @@ def main() -> int:
 
     exit_code = 0
     t0 = time.perf_counter()
-    try:
-        result, probes = asyncio.run(_dispatch(args.mode, result_path, t0, args))
-    except BaseException as e:  # noqa: B036 - 脚本本身绝不崩溃退出非零
-        print(f"[regression] 运行异常（已兜底）: {type(e).__name__}: {e}", file=sys.stderr)
-        exit_code = 1
-        result = RunResult(stop_reason=f"runner_error: {type(e).__name__}")
-        probes = {
-            "platform": CountingPlatform(SimpleNamespace(), t0=t0),
-            "llm": CountingLLM(SimpleNamespace()),
-            "execution": CountingExecution(SimpleNamespace()),
-            "clock": CountingClock(SimpleNamespace(now=lambda: 0.0)),
-            "http": None, "gateway_http": None,
-            "settings": SimpleNamespace(), "challenges": [],
-            "notes": [f"runner error: {e!r}"],
-        }
+    dispatch_stdout, dispatch_stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(dispatch_stdout), contextlib.redirect_stderr(dispatch_stderr):
+        try:
+            result, probes = asyncio.run(_dispatch(args.mode, result_path, t0, args))
+        except BaseException as error:  # noqa: B036 - preserve an auditable failure record
+            print(
+                redact(f"[regression] 运行异常（已兜底）: {type(error).__name__}: {error}"),
+                file=sys.stderr,
+            )
+            exit_code = 1
+            result = RunResult(stop_reason=f"runner_error: {type(error).__name__}")
+            probes = {
+                "platform": CountingPlatform(SimpleNamespace(), t0=t0),
+                "llm": CountingLLM(SimpleNamespace()),
+                "execution": CountingExecution(SimpleNamespace()),
+                "clock": CountingClock(SimpleNamespace(now=lambda: 0.0)),
+                "http": None, "gateway_http": None,
+                "settings": SimpleNamespace(), "challenges": [],
+                "notes": [f"runner error: {redact(str(error))}"],
+            }
+            from agent.adapters.result.ctfy_result import CtfyResultSink
+
+            CtfyResultSink(result_path).write(result)
     total_wall_s = time.perf_counter() - t0
     ended_at = datetime.now(UTC).isoformat()
 
     # integration/solve 的 competition_id 取实际用到的
     actual_cid = getattr(probes.get("settings"), "competition_id", "") or competition_id
+    redaction_failed = False
+    try:
+        # Inspect the trusted controller result, not an execution-writable file.
+        # A lossy observation must not turn into a successful report.
+        for value in asdict(result).values():
+            redact_data(value)
+    except RedactionError:
+        redaction_failed = True
+        exit_code = 1
+        result = RunResult(stop_reason="redaction_error: ambiguous_keys")
+        probes["notes"] = ["redaction failed: ambiguous mapping keys"]
+        from agent.adapters.result.ctfy_result import CtfyResultSink
 
-    record = _assemble_record(
-        run_id=run_id, mode=args.mode, started_at=started_at, ended_at=ended_at,
-        total_wall_s=total_wall_s, exit_code=exit_code, result=result,
-        result_path=result_path, probes=probes, competition_id=actual_cid,
-    )
+        CtfyResultSink(result_path).write(result)
+
+    try:
+        record = _assemble_record(
+            run_id=run_id, mode=args.mode, started_at=started_at, ended_at=ended_at,
+            total_wall_s=total_wall_s, exit_code=exit_code, result=result,
+            result_path=result_path, probes=probes, competition_id=actual_cid,
+        )
+    except RedactionError:
+        redaction_failed = True
+        exit_code = 1
+        result = RunResult(stop_reason="redaction_error: ambiguous_keys")
+        probes = {
+            "platform": CountingPlatform(SimpleNamespace(), t0=t0),
+            "llm": CountingLLM(SimpleNamespace()),
+            "execution": CountingExecution(SimpleNamespace()),
+            "clock": CountingClock(SimpleNamespace(now=lambda: 0.0)),
+            "settings": SimpleNamespace(), "challenges": [],
+            "notes": ["redaction failed: ambiguous mapping keys"],
+        }
+        from agent.adapters.result.ctfy_result import CtfyResultSink
+
+        CtfyResultSink(result_path).write(result)
+        record = _assemble_record(
+            run_id=run_id, mode=args.mode, started_at=started_at, ended_at=ended_at,
+            total_wall_s=total_wall_s, exit_code=exit_code, result=result,
+            result_path=result_path, probes=probes, competition_id="",
+        )
 
     record_path = os.path.join(out_dir, f"{run_id}.json")
-    with open(record_path, "w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
     table_path = os.path.join(out_dir, f"{run_id}.md")
-    with open(table_path, "w", encoding="utf-8") as f:
-        f.write(_render_markdown(record))
-    print(f"[regression] 记录已写入: {record_path}")
-    print(f"[regression] 字段表格: {table_path}")
-    print(
-        f"[regression] 档位={args.mode} 解出={record['solving']['questions_solved']}"
-        f"/{record['solving']['questions_total']} "
-        f"stop_reason={record['stability']['stop_reason']}"
-    )
-    print(_render_console(record))
+    trace_path = os.path.join(out_dir, f"{run_id}.trace.txt")
+    baseline = None
+    thresholds: dict[str, Any] = {}
+    stderr = redact(dispatch_stderr.getvalue())
+    stdout = redact(dispatch_stdout.getvalue())
+    candidates: dict[str, str] = {}
+    try:
+        if not args.save_baseline and os.path.exists(baseline_path):
+            with open(baseline_path, encoding="utf-8") as stream:
+                baseline = redact_data(json.load(stream))
+            thr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json")
+            with open(thr_path, encoding="utf-8") as stream:
+                thresholds = json.load(stream)
+        result_safe = _audit_outputs([result_path], stdout=stdout, stderr=stderr)
+        eligible = result_safe and record["stability"]["result_json_valid"] and not redaction_failed
+        record["artifact"]["no_secret_leak"] = False
+        if not eligible:
+            exit_code = 1
+            record["stability"]["exit_code"] = exit_code
 
-    if args.trace:
-        trace = _render_trace(probes)
-        trace_path = os.path.join(out_dir, f"{run_id}.trace.txt")
-        with open(trace_path, "w", encoding="utf-8") as f:
-            f.write(trace)
-        print(f"[regression] 轨迹已写入: {trace_path}")
-        print(trace)
+        def stage() -> tuple[dict[str, str], str]:
+            return _render_outputs(
+                record, probes, args, record_path=record_path, table_path=table_path,
+                trace_path=trace_path, baseline_path=baseline_path, baseline=baseline,
+                thresholds=thresholds, dispatch_stdout=stdout,
+            )
 
-    # 基线比对 / 存基线
-    if args.save_baseline:
-        os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
-        with open(baseline_path, "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-        print(f"[regression] 已另存基线: {baseline_path}")
-    elif os.path.exists(baseline_path):
-        with open(baseline_path, encoding="utf-8") as f:
-            baseline = json.load(f)
-        thr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json")
-        with open(thr_path, encoding="utf-8") as f:
-            thresholds = json.load(f)
-        overall, rows = _compare(record, baseline, thresholds)
-        _print_comparison(overall, rows, _dget(baseline, "meta.mode"), args.mode)
-    else:
-        print(f"[regression] 未找到基线 {baseline_path} —— 用 --save-baseline 存一个基线。")
-
+        # All formal outputs remain explicitly unverified until the complete
+        # manifest and the exact green candidate bytes have passed the audit.
+        record["stability"]["exit_code"] = 1
+        false_outputs, _ = stage()
+        _write_outputs(false_outputs)
+        record["artifact"]["no_secret_leak"] = bool(eligible)
+        record["stability"]["exit_code"] = exit_code
+        outputs, terminal = stage()
+        candidates = _stage_candidates(outputs)
+        json_destinations = (record_path, *((baseline_path,) if args.save_baseline else ()))
+        final_safe = _audit_outputs(
+            [result_path, *false_outputs, *candidates.values()],
+            stdout=terminal, stderr=stderr,
+            json_paths=(result_path, *json_destinations,
+                        *(candidates[path] for path in json_destinations)),
+        )
+        if not final_safe or not eligible:
+            # No true report has touched a formal path. Do not rely on rollback
+            # writes to revoke a green claim after disk failure or interruption.
+            print(redact("[regression] 安全审计失败：产物缺失、无效或包含凭证。"), file=sys.stderr)
+            return 1
+        _publish_candidates(candidates, record_path=record_path)
+    except Exception as error:
+        print(
+            redact(f"[regression] 输出/安全审计失败: {type(error).__name__}: {error}"),
+            file=sys.stderr,
+        )
+        return 1
+    finally:
+        _discard_candidates(candidates)
+    print(terminal, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
     return exit_code
 
 
