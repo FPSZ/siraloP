@@ -430,6 +430,8 @@ async def test_submit_resolves_all_verdict_statuses():
     }
     for signal, expected in cases.items():
         def handler(req: httpx.Request, _s=signal) -> httpx.Response:
+            if req.method == "GET" and req.url.path == "/api/v1/instances":
+                return httpx.Response(200, json={"items": []})
             assert req.url.path == "/api/v1/submissions"
             return httpx.Response(200, json={"status": _s})
 
@@ -441,6 +443,10 @@ async def test_submit_sends_answer_field():
     seen: dict[str, object] = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
+        # No live instance for this challenge: GET /instances yields an empty list
+        # so no instance_id is attached (a static-flag jeopardy submission).
+        if req.method == "GET" and req.url.path == "/api/v1/instances":
+            return httpx.Response(200, json={"items": []})
         seen["path"] = req.url.path
         seen["body"] = json.loads(req.content)
         return httpx.Response(200, json={"status": "correct"})
@@ -451,7 +457,33 @@ async def test_submit_sends_answer_field():
         "challenge_id": "SAMPLE-001",
         "question_id": "slug",
         "answer": "ctfy{win}",
+        "competition_id": COMPETITION_ID,
     }
+
+
+async def test_submit_attaches_instance_id_for_instance_challenge():
+    # Instance challenges grade against the running instance: /submissions REQUIRES
+    # instance_id (422 "instance_id: Field required" without it), so a correct flag
+    # only scores when the submission carries it. The adapter looks up the live
+    # instance for the challenge and attaches its id.
+    seen: dict[str, object] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/v1/instances":
+            return httpx.Response(200, json={"items": [
+                {"id": "inst-42", "challenge_id": "SAMPLE-001", "status": "ready"}
+            ]})
+        if req.url.path == "/api/v1/instances/inst-42":
+            return httpx.Response(200, json={"id": "inst-42", "status": "ready"})
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"status": "correct"})
+
+    v = await _adapter(handler).submit("SAMPLE-001", "flag", "FLAG{win}")
+    assert v.status is VerdictStatus.CORRECT
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["instance_id"] == "inst-42"
+    assert body["challenge_id"] == "SAMPLE-001"
 
 
 async def test_submit_wrong_carries_attempts_left():

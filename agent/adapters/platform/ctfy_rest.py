@@ -120,6 +120,10 @@ class CtfyRestAdapter:
         # network-free. An injected client is reused as-is and never closed by us.
         self._client = client if client is not None else httpx.AsyncClient(timeout=30)
         self._owns_client = client is None
+        # challenge_id -> live instance id, remembered from start_instance so a
+        # submission can carry the instance_id the grader requires (the flag is a
+        # per-team dynamic value tied to the running instance).
+        self._instance_ids: dict[str, str] = {}
 
     # ------------------------------------------------------------------ port --
     async def whoami(self) -> Account:
@@ -214,6 +218,8 @@ class CtfyRestAdapter:
             # ours, the 429 is a genuine transient/quota failure: re-raise.
             existing = await self._find_team_instance(cid)
             if existing is not None:
+                if existing.id:
+                    self._instance_ids[cid] = existing.id
                 return existing
             raise
         self._checked(resp, "POST /instances")
@@ -228,6 +234,8 @@ class CtfyRestAdapter:
             detail = await self._get_instance_detail(inst.id)
             if detail is not None:
                 inst = self._instance_from_detail(detail, fallback_id=inst.id)
+        if inst.id:
+            self._instance_ids[cid] = inst.id
         return inst
 
     async def _get_instance_detail(self, iid: str) -> dict[str, Any] | None:
@@ -337,10 +345,25 @@ class CtfyRestAdapter:
         return cls._tls_flag(s)
 
     async def submit(self, cid: str, qid: str, answer: str) -> Verdict:
-        resp = await self._request(
-            "POST", "/submissions",
-            json={"challenge_id": cid, "question_id": qid, "answer": answer},
-        )
+        body: dict[str, Any] = {
+            "challenge_id": cid, "question_id": qid, "answer": answer,
+        }
+        if self._competition_id:
+            body["competition_id"] = self._competition_id
+        # Instance challenges grade against the running instance (the flag is a
+        # per-team dynamic value), so /submissions REQUIRES instance_id — without
+        # it the platform 422s ("instance_id: Field required") and a correct flag
+        # never scores. Use the id remembered from start_instance; if absent (e.g.
+        # the adapter never started it this run), look it up once.
+        iid = self._instance_ids.get(cid)
+        if not iid:
+            found = await self._find_team_instance(cid)
+            iid = found.id if found is not None else ""
+            if iid:
+                self._instance_ids[cid] = iid
+        if iid:
+            body["instance_id"] = iid
+        resp = await self._request("POST", "/submissions", json=body)
         return self._grade(resp)
 
     async def submit_qa(self, cid: str, qid: str, answer: str) -> Verdict:
