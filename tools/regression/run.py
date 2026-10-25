@@ -53,7 +53,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import agent  # noqa: E402
-from agent.adapters._redaction import RedactionError, contains_secret, redact, redact_data  # noqa: E402
+from agent.adapters._redaction import (  # noqa: E402
+    RedactionError,
+    contains_secret,
+    redact,
+    redact_data,
+)
 from agent.domain.state import (  # noqa: E402
     Account,
     Challenge,
