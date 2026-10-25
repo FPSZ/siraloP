@@ -54,8 +54,8 @@ _OBS_TAIL = 4000       # per-observation cap (and the recent-step budget)
 # Working memory: the last K (command, observation) pairs are replayed into the
 # context each turn so the model remembers what it already ran and learned,
 # instead of re-fetching/re-reading the same files in a doom-loop.
-_HISTORY_K = 8
-_HISTORY_OBS = 1200    # budget for OLDER history steps (recent step uses _OBS_TAIL)
+_HISTORY_K = 6
+_HISTORY_OBS = 700     # budget for OLDER history steps (recent step uses _OBS_TAIL)
 
 # Circuit breaker: give up a lane after this many consecutive invalid tool calls.
 _INVALID_CALL_CAP = 3
