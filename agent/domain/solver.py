@@ -66,6 +66,15 @@ _INVALID_CALL_CAP = 3
 # wrong flags; see docs/testing/scaffold调研与优化.md #2). A flag that DID appear
 # in real output is "grounded" and is never blocked by this cap.
 _UNGROUNDED_CAP = 5
+# LLM-call resilience: a transient model-endpoint failure (rate-limit burst that
+# exhausts the adapter's retries, a flaky 5xx/4xx) must NOT abandon the whole
+# challenge. The call used to be unguarded, so one raised exception killed the
+# lane mid-solve (observed: a 429 storm on the GLM endpoint ended a run at turn 3
+# with the artifact already in hand). Instead, treat it as a recoverable hiccup:
+# brief back-off and retry the turn, giving up only after this many CONSECUTIVE
+# failures (a genuinely down/misconfigured endpoint still stops, bounded).
+_LLM_ERROR_CAP = 4
+_LLM_ERROR_BACKOFF_S = 4.0
 # How often to re-poll while the competition is paused (seconds; via ClockPort).
 _PAUSE_POLL_S = 30.0
 _PAUSE_RETRIES = 240  # ~2h ceiling of paused-retries; the Budget still bounds us.
@@ -428,6 +437,7 @@ class ReActSolver:
         self._ungrounded.clear()
         invalid_streak = 0
         stalled = 0
+        llm_errors = 0  # consecutive LLM-call failures (resilience, see _LLM_ERROR_CAP)
         seen_obs: set[str] = set()  # observation fingerprints: novelty = progress
         seen_cmds: set[str] = set()  # command fingerprints: repeat = doom-loop
 
@@ -443,9 +453,22 @@ class ReActSolver:
                 return self._final_status(challenge, RunStatus.GIVEN_UP)
             self.budget.charge(turns=1)
             self.turns += 1
-            resp = await self.llm.complete(
-                messages, model=self.model, effort="high", tools=self._tools(challenge)
-            )
+            try:
+                resp = await self.llm.complete(
+                    messages, model=self.model, effort="high",
+                    tools=self._tools(challenge),
+                )
+            except Exception:
+                # Transient model-endpoint failure: don't abandon the challenge.
+                # Back off briefly and retry the turn; give up only after this
+                # keeps failing (bounded), so a flaky/rate-limited endpoint can't
+                # kill a lane that already has the artifact in hand.
+                llm_errors += 1
+                if llm_errors >= _LLM_ERROR_CAP:
+                    return self._final_status(challenge, RunStatus.GIVEN_UP)
+                await self.clock.sleep(_LLM_ERROR_BACKOFF_S)
+                continue
+            llm_errors = 0
             self.budget.charge(
                 input_tokens=resp.input_tokens, output_tokens=resp.output_tokens
             )

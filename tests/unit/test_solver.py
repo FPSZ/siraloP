@@ -8,7 +8,7 @@ import pytest
 
 from agent.domain import policy
 from agent.domain.bus import MessageBus
-from agent.domain.solver import CliHarnessSolver, ReActSolver
+from agent.domain.solver import _LLM_ERROR_CAP, CliHarnessSolver, ReActSolver
 from agent.domain.state import (
     Budget,
     Challenge,
@@ -359,24 +359,60 @@ async def test_actual_response_tokens_stop_subsequent_calls(clock):
     assert budget.used_tokens == 13
 
 
-async def test_failed_model_call_still_consumes_reserved_turn(clock):
-    class FailingLLM(FakeLLM):
+async def test_persistent_model_errors_give_up_gracefully_not_by_raising(clock):
+    # A model endpoint that keeps failing must NOT propagate and abandon the lane
+    # mid-solve (the bug: one raised 429/5xx ended a run at turn 3 with the
+    # artifact already in hand). The loop retries with back-off and gives up
+    # gracefully only after _LLM_ERROR_CAP consecutive failures.
+    class AlwaysFailingLLM(FakeLLM):
+        def __init__(self) -> None:
+            super().__init__(lambda _m: LLMResponse())
+            self.n = 0
+
         async def complete(self, messages, **kwargs):
+            self.n += 1
             await asyncio.sleep(0)
             raise RuntimeError("provider failed")
 
     ch = make_challenge()
-    budget = Budget(max_turns=1)
+    budget = Budget(max_turns=50)  # high: the error cap, not the budget, must stop us
+    llm = AlwaysFailingLLM()
     solver = ReActSolver(
-        FailingLLM(), FakeExecution(), FakePlatform([ch]), MessageBus(),
+        llm, FakeExecution(), FakePlatform([ch]), MessageBus(),
         model="m", clock=clock, budget=budget,
     )
 
-    with pytest.raises(RuntimeError):
-        await solver.solve(ch)
-
-    assert budget.used_turns == solver.turns == 1
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP  # graceful, never raises
+    assert llm.n == _LLM_ERROR_CAP           # retried a bounded number of times
+    assert solver.turns == _LLM_ERROR_CAP
+    assert len(clock.slept) == _LLM_ERROR_CAP - 1  # backed off between attempts
     assert budget.used_tokens == 0
+
+
+async def test_recovers_after_a_transient_model_error(clock):
+    # Fail once, then submit the correct flag: the lane survives the hiccup and
+    # goes on to solve instead of dying on the first error.
+    class FlakyLLM(FakeLLM):
+        def __init__(self) -> None:
+            super().__init__(lambda _m: LLMResponse())
+            self.n = 0
+
+        async def complete(self, messages, **kwargs):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("transient 503")
+            return LLMResponse(
+                tool_calls=[ToolCall("submit_flag", {"flag": "ctfy{win}", "question_id": "q1"})]
+            )
+
+    ch = make_challenge("c1", n_questions=1)
+    solver = ReActSolver(
+        FlakyLLM(), FakeExecution(), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=5),
+    )
+
+    assert await solver.solve(ch) is RunStatus.SOLVED
+    assert solver.answers["q1"] == "ctfy{win}"
 
 
 async def test_concurrent_cli_and_react_share_turn_reservations(clock):
