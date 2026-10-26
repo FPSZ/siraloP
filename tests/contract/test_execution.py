@@ -16,7 +16,10 @@ import tracemalloc
 
 import pytest
 
-from agent.adapters.execution.subprocess_exec import SubprocessAdapter
+from agent.adapters.execution.subprocess_exec import (
+    SubprocessAdapter,
+    _tool_environment,
+)
 
 # Forward slashes so the quoted interpreter path is safe under both cmd.exe and a
 # POSIX shell (Windows dev routes through bash; backslashes are escape chars there).
@@ -169,6 +172,38 @@ async def test_tools_and_grandchildren_receive_only_safe_environment(tmp_path, m
         assert environment["APPDATA"] != str(control_home)
         assert environment["LOCALAPPDATA"] != str(control_home)
     assert not touched.exists()
+
+
+def test_preexisting_tool_dir_is_not_reprepended_over_preferred(tmp_path, monkeypatch):
+    """A tool dir already on PATH must not be re-prepended ahead of a dir that
+    precedes it there.
+
+    In the Linux competition image bash lives in /usr/bin, while the pip-installed
+    CTF interpreter (Crypto/pwntools/sympy/gmpy2) sits in /usr/local/bin, which
+    precedes /usr/bin on the default PATH. Re-prepending the shell's /usr/bin would
+    shadow /usr/local/bin's python3 with the bare system python3 that has none of
+    the CTF libs — the model's `import Crypto` would fail and it would burn turns
+    pip-installing (impossible on the offline image). The pre-existing ordering
+    must survive, and a dir already on PATH must not be duplicated.
+    """
+    preferred = tmp_path / "preferred-bin"  # stands in for /usr/local/bin
+    shell_dir = tmp_path / "shell-bin"      # stands in for /usr/bin (bash lives here)
+    other = tmp_path / "other-bin"
+    for directory in (preferred, shell_dir, other):
+        directory.mkdir()
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join(str(d) for d in (preferred, shell_dir, other))
+    )
+    env = _tool_environment(str(tmp_path / "home"), str(shell_dir / "bash"))
+
+    def norm(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path))
+
+    parts = [norm(p) for p in env["PATH"].split(os.pathsep) if p]
+    assert norm(str(preferred)) in parts and norm(str(shell_dir)) in parts
+    # The preferred dir keeps its lead; the shell's own dir is not re-prepended.
+    assert parts.index(norm(str(preferred))) < parts.index(norm(str(shell_dir)))
+    assert parts.count(norm(str(shell_dir))) == 1
 
 
 async def test_stdin_cannot_supply_engine_frames_or_forge_completion(tmp_path):

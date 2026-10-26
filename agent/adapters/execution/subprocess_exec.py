@@ -67,7 +67,24 @@ def _tool_environment(home: str, shell: str) -> dict[str, str]:
         git_tools = Path(shell).parent.parent / "usr" / "bin"
         if git_tools.is_dir():
             tool_paths.append(str(git_tools))
-    env["PATH"] = os.pathsep.join([*tool_paths, env.get("PATH", os.defpath)])
+    # Only PREPEND tool dirs that are not already on PATH. Prepending a system dir
+    # that is already present — the Linux image's /usr/bin, where bash lives —
+    # would reorder it AHEAD of /usr/local/bin and shadow the pip-installed CTF
+    # interpreter (Crypto/pwntools/sympy/gmpy2) with the bare system python3,
+    # crippling every crypto/pwn challenge: the model's `import Crypto` fails and
+    # it burns turns trying to pip-install (which cannot succeed on the offline
+    # competition image). Windows' Git-bundled tool dirs are not already on PATH,
+    # so they are still prepended as intended.
+    inherited = env.get("PATH", os.defpath)
+    seen = {
+        os.path.normcase(os.path.normpath(p))
+        for p in inherited.split(os.pathsep)
+        if p
+    }
+    new_paths = [
+        p for p in tool_paths if os.path.normcase(os.path.normpath(p)) not in seen
+    ]
+    env["PATH"] = os.pathsep.join([*new_paths, inherited]) if new_paths else inherited
     temp = os.path.join(home, "tmp")
     config = os.path.join(home, "config")
     os.makedirs(temp, exist_ok=True)
