@@ -1,16 +1,121 @@
 # ctfy-agent
 
-> 范围声明：本项目是**授权高校网络安全竞赛**（京华杯 TPCTF 2026 · 智能体赛道）的参赛作品。智能体只在赛事平台提供的**赛题环境/服务**内工作，用于自动完成平台布置的挑战并接受评测，不涉及任何平台外目标。
+ctfy-agent 是京华杯 TPCTF 2026 智能体赛道的自动解题程序。它从平台读取赛题，调用模型和工具完成解题，向平台提交答案，并在运行结束时写出 `result.json`。
 
-ctfy-agent 是一个**容器化的自主解题智能体**：比赛期间无人干预，自动从平台读取**赛题（challenge）**、在平台提供的赛题环境里尝试解答、把答案交给平台的**评测器（grader）**判定，并在每次运行结束时写出结果（`result.json`）。本仓库是这套解题引擎（通用防御性框架）本身，而非针对具体题型的漏洞利用（exploit）集合。
+> 本项目仅用于授权竞赛，工作范围限于平台提供的赛题环境和服务。本仓库实现通用解题引擎，不是针对具体题型的漏洞利用集合。
 
-面向队友的上手说明在下面；人与 AI 共同遵守的工程规约见 [AGENTS.md](AGENTS.md)，设计取舍与接口契约见 [docs/adr/](docs/adr/)。
+第一次使用，先看[快速上手](#快速上手)；想了解运行情况，看[查看结果与排查问题](#查看结果与排查问题)；参与开发前，请阅读 [AGENTS.md](AGENTS.md) 和 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## 一句话架构
+## 快速上手
 
-采用**六边形架构**（Ports & Adapters）：把稳定不变的"解题智能"放进**纯 domain**（零 I/O），把会在开发 / 正式之间切换的几条边抽成**端口（Port）**，每种环境挂一个可换的**适配器（adapter）**。
+### 1. 准备环境
 
-这几条边就是几个端口：平台（platform）、模型（llm）、执行（execution）、**结果写出（result / ResultSink）**，外加一个时钟（clock，把重试 / 退避的时间依赖抽出来便于测试）。domain 的核心是**协调器（Coordinator）**、**竞速蜂群（Swarm）**、**解题器（Solver）** 三件套。
+需要 **Python 3.11+** 和 **Bash**。Windows 请安装 Git Bash；执行工具需要本地 Bash，不能用 WSL 启动器替代。
+
+在仓库根目录创建虚拟环境：
+
+```bash
+python -m venv .venv
+```
+
+根据终端选择激活命令：
+
+| 终端 | 激活命令 |
+|---|---|
+| Linux / macOS 的 Bash | `source .venv/bin/activate` |
+| Windows Git Bash | `source .venv/Scripts/activate` |
+| Windows PowerShell | `.\.venv\Scripts\Activate.ps1` |
+
+**后续示例均使用 Bash 语法，Windows 用户请在 Git Bash 中执行。**
+
+### 2. 安装依赖并填写配置
+
+```bash
+python -m pip install -e ".[dev]"
+cp .env.example .env
+```
+
+编辑 `.env`，填写以下配置。**不要提交填写后的 `.env`。**
+
+| 配置项 | 用途 |
+|---|---|
+| `CTFY_PLATFORM_URL` | 赛事平台的 API 地址 |
+| `CTFY_TOKEN` | 平台访问令牌 |
+| `LLM_BASE_URL` | 模型网关地址 |
+| `LLM_API_KEY` | 模型网关密钥 |
+| `LLM_MODEL` | 使用的模型名称 |
+| `LLM_FLAVOR` | 网关协议：`openai` 或 `anthropic` |
+| `CTFY_WORK_DIR` | 任务配置和结果文件所在目录；本地开发建议设为 `./scratch/work` |
+
+### 3. 加载配置，运行一道题
+
+```bash
+set -a
+source .env
+set +a
+python -m agent.entrypoints.connected_main --challenge CHALLENGE_ID
+```
+
+将 `CHALLENGE_ID` 替换成平台上的题目 ID。入口**不会自动加载 `.env`**，前面三行用于把配置导入当前终端的环境变量；只加载自己维护的配置文件。
+
+不传 `--challenge` 时，会尝试当前账号可见的赛题。请先用单题确认配置和访问范围。
+
+> `ctfy-agent` 命令目前只提供版本查询和入口提示，不能代替上面的解题命令。
+
+## 运行方式
+
+| 方式 | 入口 | 适用场景 |
+|---|---|---|
+| 本地运行 | `python -m agent.entrypoints.connected_main` | 开发者在本机连接平台调试，无须重新构建镜像 |
+| 镜像运行 | `python -m agent.entrypoints.image_main` | 平台启动提交的容器，并注入任务和环境变量 |
+
+正式运行时，平台将工作目录设为 `/ctfy/work`。镜像入口按平台约定，在退出时写出结果并返回退出码 `0`；因此，**退出码为 `0` 不代表已经解出题目**。本地入口遇到初始化或拉题错误时，会写出脱敏的错误结果并返回非零退出码。
+
+没有平台凭证或模型密钥时，可以先做空跑检查：
+
+```bash
+CTFY_EVAL_DRY_RUN=1 CTFY_WORK_DIR=./scratch/work python -m agent.entrypoints.image_main
+```
+
+空跑只验证程序能够启动并写出最小结果，不调用模型，也不验证真实解题能力。
+
+## 查看结果与排查问题
+
+默认结果文件是 `CTFY_WORK_DIR/result.json`；如果 `task.json` 指定了 `result.path`，则以任务配置为准。按上述本地配置运行后，可以这样查看：
+
+```bash
+python -m json.tool scratch/work/result.json
+```
+
+重点关注以下字段：
+
+| 字段 | 含义 |
+|---|---|
+| `stop_reason` | 本次运行为什么停止，排错时先看这里 |
+| `answers`、`solved` | 已记录的答案和已解出的问题 ID |
+| `fully_solved` | 是否已完成全部已知问题，且没有待解锁问题 |
+| `turns`、`tool_calls_made` | 模型调用轮次、工具调用次数 |
+| `input_tokens`、`output_tokens` | 模型网关返回的 token 用量 |
+
+需要更详细的运行记录时，使用回归运行器。先跑不访问真实平台和模型的模拟流程：
+
+```bash
+python tools/regression/run.py --mode smoke --out scratch/reg --trace
+```
+
+它会在 `scratch/reg/` 下生成结果副本、JSON 记录、Markdown 报告和 `.trace.txt` 动作轨迹。模拟流程用于检查程序链路，不能代表真实赛题的解题水平。
+
+查看真实单题的动作轨迹：
+
+```bash
+python tools/regression/run.py --mode solve --secret-env .env --challenge CHALLENGE_ID --out scratch/reg --trace
+```
+
+**`solve` 会访问真实平台、执行工具并调用模型，会产生实际用量。** 其他参数和基线比对方法见[回归测试使用说明](docs/testing/回归测试使用说明.md)，历史测试结果见[测试记录](docs/testing/测试记录.md)。
+
+## 架构与代码导航
+
+项目采用六边形架构，也就是把**解题流程**与**外部系统的接入方式**分开。核心逻辑通过接口调用平台、模型和执行工具；更换外部实现时，不需要重写解题流程。
 
 ```mermaid
 flowchart TB
@@ -39,109 +144,94 @@ flowchart TB
     class ports contract;
 ```
 
-图中实线表示驱动或契约关系，虚线表示装配与注入；适配器仅列出当前正式路径使用的实现。
+图中实线表示驱动或接口关系，虚线表示创建与注入。三个核心组件各有分工：
 
-**铁律**：`domain/` 只依赖 `ports/` 的 I/O 契约，**不 import 任何 adapter**；具体适配器由 `wiring.py` 装配后注入。这条边界由 import-linter（`lint-imports`）在全检里强制，违规的 import 会直接让全检失败。
+| 组件 | 职责 |
+|---|---|
+| `Coordinator` | 选择题目、准备实例、分配整次运行的预算 |
+| `Swarm` | 管理解题策略，支持多个策略并行竞速 |
+| `Solver` | 循环调用模型、执行工具、提交答案，直到完成或触发停止条件 |
 
-想并行开发？认领一个端口 + 它的适配器即可独立推进：适配器矩阵见 [docs/adr/0001-agent-architecture.md](docs/adr/0001-agent-architecture.md) §3.4，新增适配器的步骤见 [AGENTS.md](AGENTS.md) §4。
+代码中的 **Port（端口）** 是接口约定，**Adapter（适配器）** 是访问外部系统的具体实现。`wiring.py` 负责创建这些实现，再交给核心组件使用。
 
-## 快速上手
+`domain/` 不得直接导入适配器、入口或 `wiring.py`，也不直接依赖 HTTP 等 I/O 库。这条依赖边界由 `lint-imports` 检查。
 
-需要 Python 3.11+ 和 Bash；Windows 本地开发使用 Git Bash，不使用 WSL 启动器代替本地 shell。
+| 位置 | 主要内容 |
+|---|---|
+| `agent/domain/` | 调度、解题循环、共享状态、策略和提示词 |
+| `agent/ports/` | 平台、模型、执行、结果写出和时钟的接口约定 |
+| `agent/adapters/` | 平台 REST、模型网关、Bash 执行器、结果文件等具体实现 |
+| `agent/wiring.py` | 组装本地运行和镜像运行所需的组件 |
+| `agent/config.py`、`agent/briefing.py` | 读取环境配置，解析 `task.json` |
+| `agent/entrypoints/` | 本地入口、镜像入口和轻量 CLI |
+| `agent/testing/fakes.py`、`tests/` | 内存模拟实现、单元测试和适配器契约测试 |
+| `tools/`、`docs/` | 检查与回归工具、设计文档和平台协议 |
+
+当前默认运行路径使用平台 REST、模型网关和本地子进程执行器。详细的模块划分、接口和适配器说明见 [ADR-0001](docs/adr/0001-agent-architecture.md)。
+
+## 运行规则
+
+### 任务与预算
+
+- **任务来源**：从 `CTFY_WORK_DIR/task.json` 读取任务；没有该文件时，使用环境配置。问题列表读取顶层 `questions` 和 `gated_questions`，信息不足时会尝试向平台补取题目详情，不把空题集当作已完成。
+- **题目模式**：`instance` 模式先启动并等待实例就绪，再将连接信息交给解题器；比赛暂停时，实例启动按平台给出的等待时间重试。`qa` 模式不启动实例，支持直接提交普通问答或选项答案。
+- **轮次上限**：`max_turns` 限制整次运行的模型调用次数，由所有题目和解题策略共享。调用前扣减额度，失败调用也计入。`task.json` 中未提供该键时，使用 `CTFY_EVAL_MAX_TURNS`；显式设为 `null` 则不限制轮次。
+- **token 上限**：优先使用任务中的 `limits.max_tokens`，否则使用 `CTFY_EVAL_MAX_TOKENS`，按网关返回的实际用量累计。这是软上限：单次响应或已发起的并行调用可能超过额度，但达到上限后不会再发起新调用。
+- **完成判定**：只有平台返回 `CORRECT`，才把答案记为正确。每次答对后重新获取问题，继续处理新解锁的问题。
+
+### 工具命令如何执行
+
+每条命令都在独立的 Bash 进程中运行，标准输入默认关闭。程序通过工作区快照恢复当前目录、普通变量、数组、导出的环境变量和函数，**并不是一直复用同一个 shell 进程**。
+
+`trap`、shell 选项和后台作业表不会跨调用保留。需要启动后台服务时，必须重定向所有标准流并自行记录 PID。
+
+命令退出码以操作系统返回值为准，不能由输出中的标记或工作区文件声明完成。超时或取消时，执行器会终止对应的进程组或 Windows Job，并丢弃本次快照。
+
+## 开发与自检
 
 ```bash
-python -m venv .venv
-. .venv/Scripts/activate            # Windows PowerShell 用：.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"             # 基础开发依赖；可选 extras 见下
-cp .env.example .env                # 填本地 token / 模型；.env 永不提交
-python -m pytest -q                 # 跑测试，应全绿
-```
-
-可选 extras（按需加）：`model`（litellm 模型网关客户端）、`mcp`（平台 MCP 传输）、`docker`（开发期每题一容器，需本机 docker）。例如 `pip install -e ".[dev,model,mcp,docker]"`。
-
-日常自检命令：
-
-```bash
-python -m pytest -q      # 测试
+python -m pytest -q      # 单元测试和契约测试
 ruff check .             # 代码风格
-lint-imports             # 架构依赖（六边形边界）
-python tools/check.py    # 一键全检：ruff + lint-imports + pytest（+ mypy，建议性不阻断）
+lint-imports             # 架构依赖边界
+python tools/check.py    # 一次执行全部检查
 ```
 
-提交前请保证 `python tools/check.py` 本地全绿。
+提交前运行 `python tools/check.py`。其中 Ruff、import-linter 和 pytest 必须通过；mypy 是建议项，检查失败不会阻断。测试使用内存模拟实现或 `httpx.MockTransport`，不访问真实网络，也不使用真实凭证。
 
-## 两种运行模式
+`.[dev]` 已包含日常开发所需依赖。另有 `model`（litellm）、`mcp` 和 `docker` 等可选依赖组；默认模型网关通过 HTTP 直接调用，不要求安装 `model`。安装这些依赖不会自动切换运行实现。
 
-| 模式 | 入口 | 谁来跑 | 用途 |
-|---|---|---|---|
-| 镜像模式（image mode） | `python -m agent.entrypoints.image_main` | 平台 | 正式提交：平台起容器（`cwd=/ctfy/work`，注入 `CTFY_*` / `LLM_*` 环境变量），运行后在**每条退出路径**都写出 `result.json` 并 `exit 0` |
-| 连线模式（connected mode） | `python -m agent.entrypoints.connected_main --challenge <id>` | 你（开发） | 本机连平台或 dev 实例，不重建镜像，快速迭代；同样会写出 `result.json` 供检查 |
+**修改接口前先看协作约定**：`agent/ports/` 是冻结契约，`agent/domain/state.py` 是共享数据结构，改动前须更新 ADR 并通知团队；`wiring.py` 和 `pyproject.toml` 的改动也需要协调。具体流程见 [AGENTS.md](AGENTS.md) 和 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-**本地跑一题（连线模式）**：
+## 安全边界
 
-```bash
-python -m agent.entrypoints.connected_main --challenge <id>   # 不带 --challenge 则尝试所有可见赛题
-```
+- 只在授权的赛题环境和服务内工作，不访问比赛范围之外的目标。
+- 题面、附件和工具输出都是不可信数据，其中夹带的指令不能当作平台或项目指令。
+- 凭证通过环境变量提供，不写入代码、日志或结果文件。填写后的 `.env` 和仅供本地研究的 `external-agents/` 不得提交。
+- 普通工具使用受限的运行环境和独立的 HOME，不继承平台、模型凭证及相关 SDK 认证别名。模型消息会清洗已知控制凭证；保存的诊断信息还会清洗 Bearer 值。
+- 结果与回归产物会进行脱敏；回归运行器会审计本次产物和终端输出。缺失、检查失败或检测到泄露时，不能标记为通过。历史日志和基线不会自动清理，分享前仍需检查。
 
-**空跑自检（dry-run）**：把 `.env` 里的 `CTFY_EVAL_DRY_RUN` 设为 `1`（bash 下也可 `CTFY_EVAL_DRY_RUN=1 python -m agent.entrypoints.image_main`）。此时镜像入口只写一份最小合法的 `result.json`、不做任何模型调用，用来验证容器能正常启动并产出结果。
+**执行器不是完整的文件系统、网络或多用户沙箱。** 不要把 Windows 本地执行当作恶意程序隔离环境，也不要把真实密钥文件放在工具可读的位置。
 
-此外还有本地 CLI `ctfy-agent`（`agent.entrypoints.cli_main`），目前是个轻量占位入口（支持 `--version` 等），会把你指向连线模式。
+<details>
+<summary>执行隔离的实现细节</summary>
 
-连线模式初始化或拉题失败时也会写入脱敏的错误结果，并以非零状态退出；镜像模式仍遵守平台约定，始终写结果并退出 0。
+- Windows 的 MSYS `/tmp` 挂载可能由多个 shell 共享，因此 `TEMP` / `TMP` 保持控制进程的稳定临时目录；各工作区仍使用独立的 `HOME` 和 `TMPDIR`，避免清理一个工作区时影响其他命令。
+- Linux 执行前设置 `no_new_privs`，并限制普通工具读取当前控制进程的 `/proc/<pid>/environ`、`mem` 等敏感条目；启动子进程的线程持有 `CAP_SYS_PTRACE` 时，会拒绝执行。
+- `no_new_privs` 不可撤销，也会限制控制线程后续启动的进程提权。上述措施不保护更上层祖先进程的环境，也不保护同 UID 可读的其他文件。
+- 模型消息中的脱敏只针对已知控制凭证，保留赛题自身未知的 Bearer 值；诊断产物则在截断和编码之前统一脱敏。
 
-### 任务、实例与预算
+</details>
 
-- `task.json` 按平台标准读取顶层 `questions` / `gated_questions`；缺少问题时尝试拉取题目详情，不把空题集当作已完成。只有已知问题全部答对且没有待解锁问题时，才报告 `fully_solved=true`；每次 CORRECT 判定后重新拉取问题以继续解锁。
-- `instance` 模式先启动实例，按平台返回的 `poll_after_s` 等待就绪，再把 host / port / TLS / SNI 连接数据交给 solver；比赛暂停时由适配器按平台等待时间重试启动，真正不可用的实例不调用模型。`qa` 模式不启动实例，普通选项答案走 QA 提交接口，不要求 flag 外形。
-- `max_turns` 是**整次运行**的模型调用轮次上限，所有题目和竞速 lane 共享扣减，发起调用前预占，失败调用也计入；CLI harness 每次启动计一轮。任务中的 `max_turns: null` 表示不设轮次上限，只有缺少该键时才继承环境配置。
-- `limits.max_tokens`（缺省用 `CTFY_EVAL_MAX_TOKENS`）按模型网关返回的实际用量在整次运行内累计。它是软上限：单次响应或已在途的并发调用可能越过阈值，但之后不再发起新调用；CLI harness 内部的 token 用量当前不可见。
+## 文档索引
 
-### 命令执行状态
-
-每条 `execute` 在独立、受监督的 Bash 进程中运行，stdin 默认 EOF。
-工作区快照恢复 cwd、普通变量、数组、export 和函数；不是复用同一个活 shell。
-trap、shell 选项与作业表不跨调用保留。后台服务必须重定向全部标准流，并自行保存 PID。
-退出码来自操作系统，stdout 中的标记和工作区文件不能声明“命令完成”；
-超时或取消会终止对应进程组 / Windows Job，并丢弃该次执行的快照。
-
-## 目录速览
-
-```
-agent/
-  domain/        纯解题逻辑（零 I/O）：coordinator / swarm / solver / state / bus / policy / prompts
-  ports/         冻结契约（Protocol）：platform / llm / execution / result / clock —— 契约即分工
-  adapters/      可换实现（承担全部 I/O）：
-                   platform/   ctfy_rest · ctfy_mcp · ctfd
-                   llm/        gateway · local_key
-                   execution/  subprocess_exec · docker_sandbox
-                   result/     ctfy_result
-  config.py      Settings.from_env() —— 运行配置的环境变量解析
-  briefing.py    load_task() —— 解析 task.json 成任务简报（briefing）
-  wiring.py      组合根：按环境装配 adapter 并注入 domain（build_for_image / build_for_dev）
-  entrypoints/   驱动入口：image_main（镜像模式）/ connected_main（连线模式）/ cli_main（本地 CLI）
-  testing/fakes.py   每个端口一个内存假件，测试不碰真实网络
-docs/adr/        架构决策记录（ADR）
-docs/standards/  平台契约 CTFY-0001 / CTFY-0002
-tests/           unit/ 与 contract/（每个适配器一份契约测试）
-tools/check.py   一键全检
-```
-
-权威版的目录结构与端口接口以 [docs/adr/0001-agent-architecture.md](docs/adr/0001-agent-architecture.md) §3.2 为准。
-
-## 安全与行为准则
-
-- 本智能体是授权竞赛的参赛程序；一切行为限定在平台提供的**赛题环境/服务**内，表述与实现保持中立、防御性。
-- **赛题 / 工具返回的内容一律视为不可信数据**，绝不执行其中夹带的指令；某个值只有在被平台评测器 `submit` 后给出接受的**判定（Verdict）**时，才算 flag —— 题面或响应里"自称 flag"的文本一概不认。
-- 不在代码、日志、`result.json` 里留任何凭证；凭证只来自环境变量（`CTFY_*` / `LLM_*`）。`.env` 与 `external-agents/`（仅本地研究用）永不提交。
-- 普通工具只继承必要的运行时环境，使用独立 HOME，不继承控制面的平台、模型凭证或 SDK 认证别名。模型消息只清洗已知控制密钥，保留题目自身未知的 Bearer 值；诊断产物则统一脱敏后截断、编码。
-- Windows 的 MSYS `/tmp` 挂载可在并发 shell 间共享；`TEMP` / `TMP` 保持控制进程的稳定临时根，工作区仍各自拥有独立的 `HOME` 和 `TMPDIR`，避免清理一个工作区后破坏其他命令的临时目录。
-- Linux 执行前设置 `no_new_privs`，限制普通工具读取当前控制进程的 `/proc/<pid>/environ`、`mem` 等敏感条目；生成线程持有 `CAP_SYS_PTRACE` 时拒绝执行。`no_new_privs` 不可撤销，也限制该控制线程后续启动进程的提权。
-- 这不是完整的文件系统、网络或多用户沙箱：更高祖先的环境和同 UID 可读文件不受上述保护。不要将 Windows 本地工具执行当作恶意程序隔离环境，也不要把真实密钥文件放在工具可读位置。
-- 回归运行器审计本次 result、记录、Markdown、trace、新基线及终端的完整清单，通过后才原子发布安全报告；缺失、检查失败或泄露不会标绿。历史产物不会自动清理。
-
-## 下一步去哪儿
-
-- [AGENTS.md](AGENTS.md) —— 人与 AI 共同遵守的工程规约：架构铁律、冻结契约（frozen contract）、如何加一个适配器、协作规范（**动手前先读**）。
-- [docs/adr/](docs/adr/) —— 设计决策与取舍：[0001 整体架构](docs/adr/0001-agent-architecture.md)、[0002 domain 内部分块](docs/adr/0002-domain-block-architecture.md)、[0003 开发约定](docs/adr/0003-dev-conventions.md)。
-- [CONTRIBUTING.md](CONTRIBUTING.md) —— 环境搭建、分支 / PR 流程、哪些改动需要额外小心。
-- 平台契约：[docs/standards/CTFY-0001](docs/standards/CTFY-0001_agent-protocol.md)（镜像 / 环境 / `result.json`）、[docs/standards/CTFY-0002](docs/standards/CTFY-0002_challenge-package.md)（赛题 / 评测模型）。
+| 想了解什么 | 看哪里 |
+|---|---|
+| 开发规则与修改边界 | [AGENTS.md](AGENTS.md)、[贡献指南](CONTRIBUTING.md) |
+| 整体架构与接口 | [ADR-0001](docs/adr/0001-agent-architecture.md) |
+| 核心逻辑的模块划分 | [ADR-0002](docs/adr/0002-domain-block-architecture.md) |
+| 代码与开发约定 | [ADR-0003](docs/adr/0003-dev-conventions.md) |
+| 镜像、环境变量和结果格式 | [CTFY-0001](docs/standards/CTFY-0001_agent-protocol.md) |
+| 赛题包与评测模型 | [CTFY-0002](docs/standards/CTFY-0002_challenge-package.md) |
+| 回归测试与字段含义 | [使用说明](docs/testing/回归测试使用说明.md)、[字段表](docs/testing/回归测试字段表.md) |
+| 历史解题成绩与测试条件 | [测试记录](docs/testing/测试记录.md) |
+| 镜像中的工具与选型 | [工具链](docs/testing/工具链.md) |
