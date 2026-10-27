@@ -218,6 +218,8 @@ async def test_control_secrets_are_not_model_context(monkeypatch, flavor):
         payload = json.loads(req.content)
         if flavor == "anthropic":
             assert req.headers["x-api-key"] == gateway_key
+            # Compatible gateways authenticate the bearer — send it too (CTFY-0001 §1.1).
+            assert req.headers["authorization"] == f"Bearer {gateway_key}"
             assert payload["system"] == "control key=***"
             user_content = payload["messages"][0]["content"]
         else:

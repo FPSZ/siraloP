@@ -169,7 +169,16 @@ class GatewayAdapter:
 
     # -- anthropic ---------------------------------------------------------
     def _anthropic_headers(self) -> dict[str, str]:
-        return {"x-api-key": self.api_key, "anthropic-version": _ANTHROPIC_VERSION}
+        # CTFY-0001 §1.1: Anthropic's OWN endpoint accepts x-api-key, but an
+        # Anthropic-COMPATIBLE gateway (the platform's model gateway) authenticates
+        # the BEARER token — a request carrying only x-api-key "arrives
+        # unauthenticated and is told it is not logged in". Send both; they carry
+        # the same value, so one key works at either endpoint.
+        return {
+            "x-api-key": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
+            "anthropic-version": _ANTHROPIC_VERSION,
+        }
 
     def _anthropic_payload(
         self,
