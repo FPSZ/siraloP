@@ -113,6 +113,56 @@ def _find_candidates(text: str) -> list[str]:
     return seen
 
 
+_PLAN_MARKER_RE = re.compile(r"^\s*(?:[-*+•]\s+|\d+[.)]\s+|>\s+)+")
+
+
+def _strip_plan_markers(line: str) -> str:
+    """Peel leading list/markdown decoration so a plan line survives parsing.
+
+    PLAN_FORMAT SHOWS the lines wrapped — ``- `HYPOTHESIS: ...``` , ``1. [ ] ...`` ,
+    ``**RULED OUT:**`` — so a model that copies the format verbatim must still be
+    understood, or `_extract_plan` drops its updated plan and the loop keeps the
+    seed plan forever. Strips bullets/numbering/quote markers, wrapping backticks
+    and bold markers; leaves the semantic content intact.
+    """
+    s = _PLAN_MARKER_RE.sub("", line.strip())
+    s = s.strip("`").strip()
+    s = s.replace("**", "").replace("__", "")
+    return s.strip()
+
+
+def _is_plan_line(s: str) -> bool:
+    """True if ``s`` (already marker-stripped) is PLAN scaffolding, not content."""
+    upper = s.upper()
+    return (
+        s[:3].lower() in ("[ ]", "[x]")
+        or upper.startswith("HYPOTHESIS:")
+        or upper.startswith("RULED OUT:")
+        or upper.startswith("RULED-OUT:")
+        or upper.startswith("PLAN:")
+    )
+
+
+def _answer_from_text(text: str) -> str:
+    """A QA answer mined from a no-tool-call message, with re-emitted PLAN lines
+    removed.
+
+    PLAN_FORMAT asks the model to re-emit its plan every turn, so a bare text
+    reply often carries the plan alongside (or instead of) an answer. Submitting
+    the whole message would send the plan to the grader as the answer. Keep only
+    non-plan lines; auto-submit only when exactly ONE short line remains — a
+    concise answer/choice. Anything else is ambiguous, so defer to an explicit
+    submit_flag tool call instead of guessing.
+    """
+    kept = [
+        s for s in (_strip_plan_markers(r) for r in (text or "").splitlines())
+        if s and not _is_plan_line(s)
+    ]
+    if len(kept) == 1 and len(kept[0]) <= 200:
+        return kept[0]
+    return ""
+
+
 def _extract_plan(text: str) -> list[str]:
     """Pull the model's own working plan to carry forward: the DIAGNOSIS lines
     (`HYPOTHESIS:` / `RULED OUT:`) plus the todo lines (`[ ]`/`[x] ...`).
@@ -125,16 +175,10 @@ def _extract_plan(text: str) -> list[str]:
     """
     out: list[str] = []
     for line in (text or "").splitlines():
-        s = line.strip()
-        upper = s.upper()
-        if (
-            s[:3].lower() in ("[ ]", "[x]")
-            or upper.startswith("HYPOTHESIS:")
-            or upper.startswith("RULED OUT:")
-            or upper.startswith("RULED-OUT:")
-        ):
+        s = _strip_plan_markers(line)
+        if s and _is_plan_line(s):
             out.append(s)
-    return out[:9]
+    return out[:12]
 
 
 def _is_qa(question: Question, run_mode: RunMode) -> bool:
@@ -392,7 +436,7 @@ class ReActSolver:
         long security prompt was measured to hurt. So the generic engine starts
         with a short ordered sweep the model reorders/prunes as it learns.
         """
-        key = (challenge.category or "").strip().lower()
+        key = prompts.normalize_category(challenge.category)
         if key == "web":
             return [
                 "HYPOTHESIS: unknown — first map the attack surface, then commit "
@@ -407,6 +451,51 @@ class ReActSolver:
                 "[ ] probe one class at a time (injection / SSTI / LFI·SSRF·file:// "
                 "/ auth bypass) with a minimal confirming request",
                 "[ ] once the flag appears in real output, submit_flag it",
+            ]
+        if key == "pwn":
+            return [
+                "HYPOTHESIS: unknown — find the input path that reaches unsafe or "
+                "logic-flawed code",
+                "RULED OUT: (none yet)",
+                "[ ] triage the attachment: file, checksec, strings; locate how "
+                "input reaches memory/logic bugs",
+                "[ ] model the state that emits the flag; build the exploit in "
+                "small steps, checking each locally (gdb)",
+                "[ ] run it against the provided service; once the flag appears, "
+                "submit_flag it",
+            ]
+        if key == "reverse":
+            return [
+                "HYPOTHESIS: unknown — recover what the program checks/computes, "
+                "then reproduce it",
+                "RULED OUT: (none yet)",
+                "[ ] triage the attachment: file, strings; disassemble/decompile "
+                "the decisive routine (radare2/objdump)",
+                "[ ] reconstruct the logic (key check / transform / secret); "
+                "script the inverse or the satisfying input",
+                "[ ] produce the value the grader expects, then submit_flag",
+            ]
+        if key == "crypto":
+            return [
+                "HYPOTHESIS: unknown — identify the scheme and the ONE weakness it "
+                "leans on",
+                "RULED OUT: (none yet)",
+                "[ ] read source/params: scheme, key sizes, nonce/padding reuse, "
+                "small/related values",
+                "[ ] pick ONE matching attack; implement with pycryptodome/sympy/"
+                "gmpy2 and verify on given values",
+                "[ ] recover the plaintext/key, then submit_flag",
+            ]
+        if key == "misc":
+            return [
+                "HYPOTHESIS: unknown — characterize what the artifact/service IS "
+                "before acting",
+                "RULED OUT: (none yet)",
+                "[ ] triage: file/binwalk/exiftool/strings on attachments; read "
+                "any prompt/protocol carefully",
+                "[ ] follow the one concrete lead (hidden data, encoding chain, a "
+                "service interaction) end to end",
+                "[ ] retrieve the value the grader expects, then submit_flag",
             ]
         return [
             "HYPOTHESIS: unknown — recon the target and the question first",
@@ -684,7 +773,10 @@ class ReActSolver:
     async def _maybe_submit_from_text(self, challenge: Challenge, text: str) -> bool:
         q = self._question_for(challenge, None)
         if q is not None and _is_qa(q, self.run_mode):
-            return await self._submit(challenge, text.strip(), q.id)
+            answer = _answer_from_text(text)
+            if not answer:
+                return False  # the model only re-emitted its plan, not an answer
+            return await self._submit(challenge, answer, q.id)
         progressed = False
         for cand in _find_candidates(text):
             if await self._submit(challenge, cand, None):

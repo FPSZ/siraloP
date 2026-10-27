@@ -51,7 +51,12 @@ def build_for_image(settings: Settings) -> Wiring:
     llm = GatewayAdapter(
         settings.llm_base_url, settings.llm_api_key, settings.llm_flavor, clock=clock
     )
-    execution = SubprocessAdapter()
+    # Root the executor at the platform's work dir (CTFY_WORK_DIR, e.g. /ctfy/work)
+    # so new_workspace() seeds each solve attempt with the challenge attachments the
+    # platform stages THERE (CTFY-0001). With the default empty temp root, those
+    # files never reach the agent and attachment-based challenges (pwn/reverse/
+    # crypto/misc) start from an empty directory.
+    execution = SubprocessAdapter(root=settings.work_dir)
     result = CtfyResultSink(settings.default_result_path)
     return Wiring(platform=platform, llm=llm, execution=execution, result=result, clock=clock)
 
