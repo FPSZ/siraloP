@@ -153,10 +153,13 @@ def _answer_from_text(text: str) -> str:
     non-plan lines; auto-submit only when exactly ONE short line remains — a
     concise answer/choice. Anything else is ambiguous, so defer to an explicit
     submit_flag tool call instead of guessing.
+
+    Normalize decoration only to identify plan lines; preserve the answer's
+    literal contents apart from surrounding whitespace.
     """
     kept = [
-        s for s in (_strip_plan_markers(r) for r in (text or "").splitlines())
-        if s and not _is_plan_line(s)
+        s for s in (r.strip() for r in (text or "").splitlines())
+        if s and not _is_plan_line(_strip_plan_markers(s))
     ]
     if len(kept) == 1 and len(kept[0]) <= 200:
         return kept[0]

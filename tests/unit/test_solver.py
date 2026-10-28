@@ -187,6 +187,36 @@ async def test_plain_qa_answers_reach_grader(
     assert platform.routes == ["qa"]
 
 
+@pytest.mark.parametrize(
+    ("reply", "answer"),
+    [
+        ("__init__", "__init__"),
+        (
+            "- `HYPOTHESIS: compare the values`\n"
+            "**RULED OUT:** guesses\n"
+            "1. [x] checked\n"
+            "2**8",
+            "2**8",
+        ),
+        ("  `literal`  ", "`literal`"),
+        ("1. option", "1. option"),
+    ],
+)
+async def test_qa_text_reply_preserves_literal_answer(clock, reply, answer):
+    ch = make_challenge(questions=[Question("q1")])
+    platform = FakePlatform([ch], answers={("c1", "q1"): answer})
+    solver = ReActSolver(
+        FakeLLM([LLMResponse(text=reply)]), FakeExecution(), platform, MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=1), run_mode=RunMode.QA,
+    )
+
+    status = await solver.solve(ch)
+
+    assert platform.submissions == [("c1", "q1", answer)]
+    assert status is RunStatus.SOLVED
+    assert solver.answers == {"q1": answer}
+
+
 @pytest.mark.parametrize("kind", ["react", "cli"])
 @pytest.mark.parametrize(
     "verdict", [VerdictStatus.WRONG, VerdictStatus.CAPPED, VerdictStatus.UNGRADED]
