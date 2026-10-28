@@ -21,7 +21,7 @@ from agent.briefing import load_task
 from agent.config import Settings
 from agent.domain.coordinator import Coordinator
 from agent.domain.state import RunResult
-from agent.entrypoints._resources import close_ports
+from agent.entrypoints._resources import close_ports, split_timeout
 from agent.wiring import build_for_dev
 
 
@@ -29,34 +29,48 @@ async def _run(args: argparse.Namespace) -> RunResult:
     result = RunResult(stop_reason="not_started")
     sink = CtfyResultSink(Settings().default_result_path, stdout_fallback=True)
     wiring = None
+    coord: Coordinator | None = None
+    work_timeout, cleanup_timeout = split_timeout(None)
     try:
         settings = Settings.from_env()
+        work_timeout, cleanup_timeout = split_timeout(settings.max_wall_s)
         sink = CtfyResultSink(settings.default_result_path, stdout_fallback=True)
         task = load_task(settings)
         sink = CtfyResultSink(task.result_path, stdout_fallback=True)
-        wiring = build_for_dev(settings)
-        # Include challenge fetching in the same result/cleanup boundary as run.
-        if args.challenge:
-            challenge = await wiring.platform.get_challenge(args.challenge)
-            task = replace(task, challenge=challenge)
-        coord = Coordinator(
-            wiring.platform,
-            wiring.llm,
-            wiring.execution,
-            sink,
-            clock=wiring.clock,
-            task=task,
-            settings=settings,
-        )
-        result = await coord.run()
+        with anyio.fail_after(work_timeout):
+            wiring = build_for_dev(settings)
+            deadline = (
+                wiring.clock.now() + work_timeout if work_timeout is not None else None
+            )
+            # Include challenge fetching in the same wall budget as model work.
+            if args.challenge:
+                challenge = await wiring.platform.get_challenge(args.challenge)
+                task = replace(task, challenge=challenge)
+            remaining = max(0.0, deadline - wiring.clock.now()) if deadline is not None else None
+            coord = Coordinator(
+                wiring.platform,
+                wiring.llm,
+                wiring.execution,
+                sink,
+                clock=wiring.clock,
+                task=task,
+                settings=replace(settings, max_wall_s=remaining),
+            )
+            result = await coord.run()
     except BaseException as error:  # noqa: B036 - do not expose an unsafe traceback
-        result = RunResult(stop_reason=redact(f"error: {type(error).__name__}: {error}"))
+        if coord is not None:
+            result = coord.current_result
+        result.fully_solved = False
+        result.stop_reason = (
+            "timeout" if isinstance(error, TimeoutError)
+            else redact(f"error: {type(error).__name__}: {error}")
+        )
     finally:
-        try:
-            if wiring is not None:
-                await close_ports(wiring.execution, wiring.llm, wiring.platform)
-        finally:
-            sink.write(result)
+        sink.write(result)
+        if wiring is not None:
+            await close_ports(
+                wiring.execution, wiring.llm, wiring.platform, timeout_s=cleanup_timeout
+            )
     return result
 
 
@@ -86,7 +100,7 @@ def main() -> int:
     print(redact(
         f"done: {result.stop_reason}; solved={result.solved}; answers={len(result.answers)}"
     ))
-    return 1 if result.stop_reason.startswith("error") else 0
+    return 1 if result.stop_reason.startswith("error") or result.stop_reason == "timeout" else 0
 
 
 if __name__ == "__main__":

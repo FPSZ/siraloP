@@ -7,6 +7,7 @@ RunResult (the entrypoint always writes it — CTFY-0001 §3: not writing == fai
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import cast
 
 from agent.domain.bus import MessageBus
@@ -58,6 +59,12 @@ class Coordinator:
         self.task = task
         self.settings = settings
         self.bus = MessageBus()
+        self._current_result = RunResult(stop_reason="not_started")
+
+    @property
+    def current_result(self) -> RunResult:
+        """Latest verified answers and accounting, including interrupted runs."""
+        return self._current_result
 
     # -- model selection ----------------------------------------------------
     def _models(self) -> list[str]:
@@ -95,9 +102,14 @@ class Coordinator:
         max_tokens = limits.get("max_tokens")
         if not isinstance(max_tokens, int):
             max_tokens = getattr(self.settings, "max_tokens", None)
+        max_wall_s = getattr(self.settings, "max_wall_s", None)
         return Budget(
             max_turns=max_turns if isinstance(max_turns, int) else None,
             max_tokens=max_tokens if isinstance(max_tokens, int) else None,
+            deadline=(
+                self.clock.now() + max_wall_s
+                if isinstance(max_wall_s, (int, float)) else None
+            ),
         )
 
     # -- lane construction --------------------------------------------------
@@ -108,6 +120,7 @@ class Coordinator:
         *,
         instance: Instance | None = None,
         run_mode: RunMode = RunMode.INSTANCE,
+        on_progress: Callable[[], None] | None = None,
     ) -> tuple[list[SolverStrategy], list[object]]:
         """Build competing lanes against the same run budget and ready target."""
         diff = (challenge.difficulty or "").strip().lower()
@@ -126,6 +139,7 @@ class Coordinator:
                     budget=budget,
                     instance=instance,
                     run_mode=run_mode,
+                    on_progress=on_progress,
                 )
             )
         cli = getattr(self.settings, "harness_cli", "")
@@ -139,6 +153,7 @@ class Coordinator:
                     budget=budget,
                     instance=instance,
                     run_mode=run_mode,
+                    on_progress=on_progress,
                 )
             )
         strategies = cast(list[SolverStrategy], list(lanes))
@@ -146,7 +161,16 @@ class Coordinator:
 
     # -- the run ------------------------------------------------------------
     async def run(self) -> RunResult:
-        result = RunResult()
+        self._current_result = RunResult()
+        budget = self._allocate_budget()
+        self.result.write(self._current_result)
+        try:
+            return await self._run_inner(budget)
+        finally:
+            self.result.write(self._current_result)
+
+    async def _run_inner(self, budget: Budget) -> RunResult:
+        result = self._current_result
         try:
             challenges = await self._obtain_challenges()
         except Exception as e:
@@ -158,7 +182,6 @@ class Coordinator:
             result.stop_reason = "no challenges"
             return result
 
-        budget = self._allocate_budget()
         statuses: list[RunStatus] = []
         for challenge in ordered:
             try:
@@ -175,6 +198,8 @@ class Coordinator:
         if not result.stop_reason:
             if result.fully_solved:
                 result.stop_reason = "completed"
+            elif budget.deadline is not None and self.clock.now() >= budget.deadline:
+                result.stop_reason = "timeout"
             elif budget.exhausted(now=self.clock.now()):
                 result.stop_reason = "budget_exhausted"
             else:
@@ -198,11 +223,16 @@ class Coordinator:
         return RunMode.INSTANCE
 
     async def _prepare_instance(self, cid: str, budget: Budget) -> Instance | None:
+        if budget.exhausted(now=self.clock.now()):
+            return None
         instance = await self.platform.start_instance(cid)
         while instance.status is InstanceStatus.STARTING:
             if budget.exhausted(now=self.clock.now()):
                 return None
-            await self.clock.sleep(instance.poll_after_s)
+            delay = instance.poll_after_s
+            if budget.deadline is not None:
+                delay = min(delay, max(0.0, budget.deadline - self.clock.now()))
+            await self.clock.sleep(delay)
             if budget.exhausted(now=self.clock.now()):
                 return None
             instance = await self.platform.start_instance(cid)
@@ -252,26 +282,45 @@ class Coordinator:
             instance = await self._prepare_instance(challenge.id, budget)
             if instance is None:
                 return RunStatus.GIVEN_UP
+        if budget.exhausted(now=self.clock.now()):
+            return RunStatus.GIVEN_UP
+        baseline = (
+            result.turns, result.tool_calls_made, result.input_tokens, result.output_tokens
+        )
+        lanes: list[object] = []
+
+        def checkpoint() -> None:
+            self._accumulate(lanes, result, baseline)
+            self.result.write(result)
+
         strategies, lanes = self._build_lanes(
-            challenge, budget, instance=instance, run_mode=mode
+            challenge, budget, instance=instance, run_mode=mode, on_progress=checkpoint
         )
         lane_max = _LANES_BY_DIFFICULTY.get(
             (challenge.difficulty or "").strip().lower(), _DEFAULT_LANES
         )
         swarm = Swarm(strategies, clock=self.clock, max_lanes=max(lane_max, 1))
-        status = await swarm.solve(challenge)
-        self._accumulate(lanes, result)
-        return status
+        try:
+            return await swarm.solve(challenge)
+        finally:
+            checkpoint()
 
-    def _accumulate(self, lanes: list[object], result: RunResult) -> None:
-        """Fold each lane's verified answers + accounting into the RunResult."""
+    def _accumulate(
+        self, lanes: list[object], result: RunResult, baseline: tuple[int, int, int, int]
+    ) -> None:
+        """Refresh lane totals without adding cumulative counters more than once."""
+        turns, tool_calls, input_tokens, output_tokens = baseline
         for lane in lanes:
             for qid, answer in getattr(lane, "answers", {}).items():
                 result.answers.setdefault(qid, answer)
             for qid in getattr(lane, "solved_questions", []):
                 if qid not in result.solved:
                     result.solved.append(qid)
-            result.turns += getattr(lane, "turns", 0)
-            result.tool_calls_made += getattr(lane, "tool_calls_made", 0)
-            result.input_tokens += getattr(lane, "input_tokens", 0)
-            result.output_tokens += getattr(lane, "output_tokens", 0)
+            turns += getattr(lane, "turns", 0)
+            tool_calls += getattr(lane, "tool_calls_made", 0)
+            input_tokens += getattr(lane, "input_tokens", 0)
+            output_tokens += getattr(lane, "output_tokens", 0)
+        result.turns = turns
+        result.tool_calls_made = tool_calls
+        result.input_tokens = input_tokens
+        result.output_tokens = output_tokens

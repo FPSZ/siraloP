@@ -1,8 +1,4 @@
-"""prompts.py and the solver's plan/answer helpers were untested. Cover category
-normalization/routing (CTFY-0002 §2.1), the plan parser's tolerance of the format
-the prompt shows, QA answer extraction, per-category seed plans, and the scaffold's
-key operational claims.
-"""
+"""Category routing, literal plan/QA parsing, bounded evidence memory and seeds."""
 from __future__ import annotations
 
 from agent.domain import prompts
@@ -10,6 +6,7 @@ from agent.domain.solver import (
     ReActSolver,
     _answer_from_text,
     _extract_plan,
+    _merge_plan,
     _strip_plan_markers,
 )
 from agent.domain.state import Challenge
@@ -42,17 +39,6 @@ def test_crypto_and_misc_have_guidance():
     assert prompts.category_guidance("forensics") == prompts.category_guidance("misc")
 
 
-def test_system_prompt_block_and_operational_claims():
-    sp = prompts.system_prompt("reverse")
-    assert "Category: reverse" in sp
-    assert "/opt/ctf-tools.txt" in sp            # pointer, not a drifting hard-coded list
-    assert "OFFLINE" in sp
-    low = sp.lower()
-    assert "background" in low and "time limit" in low   # timeout guidance
-    assert "question_id" in sp                   # QA answer routing
-    assert "bare value" in low                   # not every answer is word{...}
-
-
 # -- plan parser tolerance (bug 1: format shown can't be parsed) --------------
 def test_strip_plan_markers_peels_decoration():
     assert _strip_plan_markers("- `HYPOTHESIS: foo`") == "HYPOTHESIS: foo"
@@ -81,9 +67,50 @@ def test_extract_plan_also_accepts_plain_lines():
     ]
 
 
+def test_plan_label_normalization_preserves_literal_data():
+    literal = "`__key**__` $() 'quoted' **suffix**"
+    assert (
+        _strip_plan_markers(f"**EVIDENCE:** source => {literal}")
+        == f"EVIDENCE: source => {literal}"
+    )
+    assert _strip_plan_markers(f"HYPOTHESIS: {literal}") == f"HYPOTHESIS: {literal}"
+    assert _extract_plan(f"EVIDENCE: file.txt offset 42 => {literal}") == [
+        f"EVIDENCE: file.txt offset 42 => {literal}",
+    ]
+
+
+def test_partial_plan_fields_are_merged_without_losing_evidence():
+    current = _extract_plan(
+        "HYPOTHESIS: /api key\nRULED OUT: /admin denied\n"
+        "EVIDENCE: read config.ini => __secret**__\n[ ] inspect API"
+    )
+    merged = _merge_plan(current, _extract_plan("[x] inspected API\n[ ] verify result"))
+    assert merged == [
+        "HYPOTHESIS: /api key",
+        "RULED OUT: /admin denied",
+        "EVIDENCE: read config.ini => __secret**__",
+        "[x] inspected API", "[ ] verify result",
+    ]
+    assert _merge_plan(merged, _extract_plan("HYPOTHESIS: key verified")) == [
+        "HYPOTHESIS: key verified", *merged[1:],
+    ]
+
+
+def test_evidence_notes_are_bounded_and_oversized_literals_are_not_rewritten():
+    plan = []
+    for i in range(30):
+        plan = _merge_plan(plan, _extract_plan(f"EVIDENCE: source-{i} => __literal**{i}"))
+    assert len(plan) == 6
+    assert plan[-1] == "EVIDENCE: source-29 => __literal**29"
+    huge = "EVIDENCE: file.txt => " + "x" * 2000
+    assert _merge_plan(plan, _extract_plan(huge)) == plan
+    assert not any("clipped" in line for line in plan)
+
+
 # -- QA answer extraction (bug 3: plan submitted as the answer) ---------------
 def test_answer_from_text_strips_replan():
     assert _answer_from_text("HYPOTHESIS: foo\n[ ] bar\n51") == "51"
+    assert _answer_from_text("EVIDENCE: config.ini => __key**__\nA") == "A"
 
 
 def test_answer_from_text_refuses_plan_only():

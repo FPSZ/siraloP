@@ -71,3 +71,15 @@ def test_unfunded_run_resolves_to_empty_key(clean_env):
     # instead of spending another account (CTFY-0001 §1.1).
     s = Settings.from_env()
     assert s.llm_api_key == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", None), ("0", 0.0), ("0.25", 0.25), ("-1", None), ("nan", None), ("inf", None)],
+)
+def test_application_wall_limit_requires_finite_nonnegative_seconds(
+    clean_env, value, expected
+):
+    clean_env.setenv("CTFY_AGENT_MAX_WALL_S", value)
+
+    assert Settings.from_env().max_wall_s == expected

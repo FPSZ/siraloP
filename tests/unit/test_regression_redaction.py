@@ -57,7 +57,8 @@ def _install_dispatch(monkeypatch, *, artifact="safe"):
         await execution.run(response.tool_calls[0].arguments["cmd"])
         await llm.complete([], model=settings.llm_model)
         result = RunResult(
-            answers={_SECRET: _SECRET}, stop_reason="stop " + _SECRET, writeup=_SECRET,
+            answers={_SECRET: _SECRET, "smk-web-q1": "synthetic-answer"},
+            solved=["smk-web-q1"], stop_reason="stop " + _SECRET, writeup=_SECRET,
         )
         if artifact == "collision":
             result.answers = {_SECRET: "first", "***": "second"}
@@ -80,7 +81,7 @@ def _install_dispatch(monkeypatch, *, artifact="safe"):
         print("adapter stderr " + _SECRET, file=sys.stderr)
         return result, {
             "settings": settings, "platform": platform, "llm": llm,
-            "execution": execution, "clock": clock, "challenges": [],
+            "execution": execution, "clock": clock, "challenges": run._smoke_challenges(),
             "notes": ["notes " + _SECRET],
         }
 
@@ -141,10 +142,12 @@ def test_cli_missing_invalid_or_unredacted_result_cannot_report_green(
     assert "安全审计失败" in captured.err
     assert not contains_secret(captured.out + captured.err)
     assert _record(out)["artifact"]["no_secret_leak"] is False
-    assert json.loads(baseline.read_text(encoding="utf-8"))["artifact"]["no_secret_leak"] is False
+    assert not baseline.exists()
 
 
-def test_cli_exception_path_scrubs_diagnostic_record_and_baseline(tmp_path, monkeypatch, capsys):
+def test_cli_exception_scrubs_diagnostic_record_without_publishing_baseline(
+    tmp_path, monkeypatch, capsys,
+):
     async def fail(*args):
         print("before failure " + _SECRET)
         raise RuntimeError("synthetic failure " + _SECRET)
@@ -156,7 +159,8 @@ def test_cli_exception_path_scrubs_diagnostic_record_and_baseline(tmp_path, monk
     captured = capsys.readouterr()
     assert not contains_secret(captured.out + captured.err)
     assert "RuntimeError" in captured.err
-    for path in [*out.iterdir(), baseline]:
+    assert not baseline.exists()
+    for path in out.iterdir():
         assert not contains_secret(path.read_text(encoding="utf-8"))
     assert _record(out)["stability"]["exit_code"] == 1
 
@@ -169,7 +173,7 @@ def test_cli_comparison_scrubs_baseline_values_and_path_messages(tmp_path, monke
     )
     _install_dispatch(monkeypatch)
     _argv(monkeypatch, out, baseline, save=False)
-    assert run.main() == 0
+    assert run.main() == 1
     captured = capsys.readouterr()
     assert "回归比对" in captured.out
     assert not contains_secret(captured.out + captured.err)
@@ -210,7 +214,7 @@ def test_manifest_checks_terminal_and_every_expected_file(tmp_path):
     assert not run._audit_outputs([], stdout="", stderr="")
 
 
-def test_post_write_trace_failure_updates_final_record_and_baseline(tmp_path, monkeypatch, capsys):
+def test_post_write_trace_failure_cannot_publish_baseline(tmp_path, monkeypatch, capsys):
     out, baseline = tmp_path / "out", tmp_path / "baseline.json"
     _install_dispatch(monkeypatch)
     _argv(monkeypatch, out, baseline)
@@ -232,7 +236,7 @@ def test_post_write_trace_failure_updates_final_record_and_baseline(tmp_path, mo
     captured = capsys.readouterr()
     assert not contains_secret(captured.out + captured.err)
     assert _record(out)["artifact"]["no_secret_leak"] is False
-    assert json.loads(baseline.read_text(encoding="utf-8"))["artifact"]["no_secret_leak"] is False
+    assert not baseline.exists()
 
 
 def test_json_artifact_validation_does_not_depend_on_filename_suffix(tmp_path):
@@ -301,37 +305,45 @@ def test_mixed_escaped_logs_do_not_bypass_complete_runner_audit(tmp_path, monkey
     assert _record(out)["artifact"]["no_secret_leak"] is True
 
 
-def test_formal_reports_remain_false_until_full_candidate_audit(tmp_path, monkeypatch):
+def test_baseline_promotion_follows_audit_and_run_publication(tmp_path, monkeypatch):
     out, baseline = tmp_path / "out", tmp_path / "baseline.json"
+    previous = b'{"previous": "valid baseline bytes"}'
+    baseline.write_bytes(previous)
     _install_dispatch(monkeypatch)
     _argv(monkeypatch, out, baseline)
     original_audit, original_publish = run._audit_outputs, run._publish_candidates
     audited = False
+    published = False
 
     def audit(paths, **kwargs):
         nonlocal audited
+        assert baseline.read_bytes() == previous
+        ok = original_audit(paths, **kwargs)
         if len(paths) > 1:
-            assert _record(out)["artifact"]["no_secret_leak"] is False
-            assert _record(out)["stability"]["exit_code"] == 1
-            baseline_record = json.loads(baseline.read_text(encoding="utf-8"))
-            assert baseline_record["artifact"]["no_secret_leak"] is False
-            assert any(".regression-" in path for path in paths)
-            audited = original_audit(paths, **kwargs)
-            return audited
-        return original_audit(paths, **kwargs)
+            audited = ok
+        return ok
 
     def publish(candidates, *, record_path):
+        nonlocal published
         assert audited
-        assert _record(out)["artifact"]["no_secret_leak"] is False
-        with open(candidates[record_path], encoding="utf-8") as stream:
-            candidate = json.load(stream)
-        assert candidate["artifact"]["no_secret_leak"] is True
+        assert baseline.read_bytes() == previous
+        assert str(baseline) not in candidates
         original_publish(candidates, record_path=record_path)
+        published = True
+
+    original_replace = run.os.replace
+
+    def replace(source, destination):
+        if destination == str(baseline):
+            assert published
+            assert _record(out)["artifact"]["no_secret_leak"] is True
+        original_replace(source, destination)
 
     monkeypatch.setattr(run, "_audit_outputs", audit)
     monkeypatch.setattr(run, "_publish_candidates", publish)
+    monkeypatch.setattr(run.os, "replace", replace)
     assert run.main() == 0
-    assert _record(out)["artifact"]["no_secret_leak"] is True
+    assert baseline.read_bytes() != previous
     assert not list(out.glob(".regression-*"))
     assert not list(tmp_path.glob(".regression-*"))
 
@@ -371,7 +383,7 @@ def test_staged_candidate_corruption_cannot_publish_true(tmp_path, monkeypatch, 
     monkeypatch.setattr(run, "_stage_candidates", stage_and_corrupt)
     assert run.main() == 1
     assert _record(out)["artifact"]["no_secret_leak"] is False
-    assert json.loads(baseline.read_text(encoding="utf-8"))["artifact"]["no_secret_leak"] is False
+    assert not baseline.exists()
     assert not list(out.glob(".regression-*"))
     captured = capsys.readouterr()
     assert not contains_secret(captured.out + captured.err)

@@ -6,6 +6,7 @@ boundaries also inspect the environment to isolate tools and redact credentials.
 """
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ class Settings:
     work_dir: str = "/ctfy/work"
     max_turns: int | None = None
     max_tokens: int | None = None
+    # Optional application limit, not a platform task.json field.
+    max_wall_s: float | None = None
     dry_run: bool = False
     # --- model gateway (CTFY-0001 §1.1) ---
     llm_flavor: str = ""          # "anthropic" | "openai"
@@ -39,6 +42,14 @@ class Settings:
             v = os.environ.get(name)
             return int(v) if v and v.lstrip("-").isdigit() else None
 
+        def _seconds(name: str) -> float | None:
+            value = os.environ.get(name, "")
+            try:
+                seconds = float(value)
+            except ValueError:
+                return None
+            return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
         env = os.environ
         flavor, api_key, base_url, model = _resolve_llm(env)
         return Settings(
@@ -49,6 +60,7 @@ class Settings:
             work_dir=env.get("CTFY_WORK_DIR", "/ctfy/work"),
             max_turns=_int("CTFY_EVAL_MAX_TURNS"),
             max_tokens=_int("CTFY_EVAL_MAX_TOKENS"),
+            max_wall_s=_seconds("CTFY_AGENT_MAX_WALL_S"),
             dry_run=env.get("CTFY_EVAL_DRY_RUN") == "1",
             llm_flavor=flavor,
             llm_api_key=api_key,

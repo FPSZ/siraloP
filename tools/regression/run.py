@@ -73,7 +73,7 @@ from agent.domain.state import (  # noqa: E402
     Verdict,
     VerdictStatus,
 )
-from agent.entrypoints._resources import close_ports  # noqa: E402
+from agent.entrypoints._resources import close_ports, split_timeout  # noqa: E402
 
 # ===========================================================================
 # 非侵入埋点：Counting* 包装器（结构实现各端口，委托给真实/假适配器）
@@ -123,6 +123,7 @@ class CountingPlatform:
         # 便于组装记录时直接取用
         self.account: Account | None = None
         self.listed_challenges: list[Challenge] = []
+        self.fetched_challenges: dict[str, Challenge] = {}
         self.scoreboard_entries: int = 0
 
     def _rec(self, name: str, dt: float) -> None:
@@ -151,7 +152,9 @@ class CountingPlatform:
         return out
 
     async def get_challenge(self, cid: str) -> Challenge:
-        return await self._timed("get_challenge", self._inner.get_challenge(cid))
+        challenge = await self._timed("get_challenge", self._inner.get_challenge(cid))
+        self.fetched_challenges[cid] = challenge
+        return challenge
 
     async def start_instance(self, cid: str) -> Instance:
         inst = await self._timed("start_instance", self._inner.start_instance(cid))
@@ -431,7 +434,10 @@ def _build_smoke(
     platform = CountingPlatform(FakePlatform(_smoke_challenges()), t0=t0)
     llm = CountingLLM(FakeLLM(_smoke_llm_script))
     execution = CountingExecution(FakeExecution())
-    settings = SimpleNamespace(llm_model="fake-smoke-model", max_tokens=None, harness_cli="")
+    settings = SimpleNamespace(
+        llm_model="fake-smoke-model", max_tokens=None, max_turns=12,
+        max_wall_s=None, harness_cli="",
+    )
     return settings, platform, llm, execution, clock
 
 
@@ -497,7 +503,7 @@ def _load_secret_env(path: str) -> None:
                 os.environ[key] = val
 
 
-def _stage_attachments(
+async def _stage_attachments(
     platform_url: str, token: str, challenge_id: str, work_root: str
 ) -> list[str]:
     """Download a challenge's attachments into the adapter ROOT so new_workspace()
@@ -511,8 +517,8 @@ def _stage_attachments(
     headers = {"Authorization": f"Bearer {token}"}
     staged: list[str] = []
     try:
-        with httpx.Client(timeout=30, headers=headers) as c:
-            lst = c.get(f"{base}/challenges/{challenge_id}/attachments")
+        async with httpx.AsyncClient(timeout=30, headers=headers) as c:
+            lst = await c.get(f"{base}/challenges/{challenge_id}/attachments")
             names: list[str] = []
             if lst.status_code == 200:
                 data = lst.json()
@@ -527,7 +533,7 @@ def _stage_attachments(
             for name in names:
                 # keep the download inside the workspace (no path traversal)
                 safe = os.path.basename(name)
-                r = c.get(f"{base}/challenges/{challenge_id}/attachments/{name}")
+                r = await c.get(f"{base}/challenges/{challenge_id}/attachments/{name}")
                 if r.status_code == 200:
                     with open(os.path.join(ws, safe), "wb") as fh:
                         fh.write(r.content)
@@ -540,7 +546,7 @@ def _stage_attachments(
 _READY_WORDS = {"ready", "running", "up", "active", "available", "healthy"}
 
 
-def _stage_instance_attachments(
+async def _stage_instance_attachments(
     platform_url: str, token: str, challenge_id: str,
     competition_id: str, work_root: str,
 ) -> list[str]:
@@ -552,38 +558,37 @@ def _stage_instance_attachments(
     these into /ctfy/work; dev solve-mode must mirror that so the agent can see the
     file. Start (or reuse — start_instance is idempotent) the instance, wait until
     ready, then download. Best-effort; never raises."""
-    import time
-
     import httpx
 
     base = platform_url.rstrip("/") + "/api/v1"
     headers = {"Authorization": f"Bearer {token}"}
     staged: list[str] = []
     try:
-        with httpx.Client(timeout=30, headers=headers, follow_redirects=True) as c:
-            def mine() -> dict[str, Any] | None:
-                r = c.get(f"{base}/instances")
+        async with httpx.AsyncClient(timeout=30, headers=headers, follow_redirects=True) as c:
+            async def mine() -> dict[str, Any] | None:
+                r = await c.get(f"{base}/instances")
                 rows = r.json().get("items", []) if r.status_code == 200 else []
                 return next(
                     (it for it in rows if it.get("challenge_id") == challenge_id), None
                 )
 
-            inst = mine()
+            inst = await mine()
             if inst is None:
                 body: dict[str, Any] = {"challenge_id": challenge_id}
                 if competition_id:
                     body["competition_id"] = competition_id
-                c.post(f"{base}/instances", json=body)
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                inst = mine()
+                await c.post(f"{base}/instances", json=body)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 120
+            while loop.time() < deadline:
+                inst = await mine()
                 if inst and str(inst.get("status", "")).lower() in _READY_WORDS:
                     break
-                time.sleep(3)
+                await asyncio.sleep(3)
             if not inst:
                 return staged
             iid = inst.get("id")
-            lst = c.get(f"{base}/instances/{iid}/attachments")
+            lst = await c.get(f"{base}/instances/{iid}/attachments")
             names: list[str] = []
             if lst.status_code == 200:
                 data = lst.json()
@@ -597,7 +602,7 @@ def _stage_instance_attachments(
                 ]
             for name in names:
                 safe = os.path.basename(name)
-                r = c.get(f"{base}/instances/{iid}/attachments/{name}")
+                r = await c.get(f"{base}/instances/{iid}/attachments/{name}")
                 if r.status_code == 200:
                     with open(os.path.join(work_root, safe), "wb") as fh:
                         fh.write(r.content)
@@ -607,17 +612,17 @@ def _stage_instance_attachments(
     return staged
 
 
-def _detect_qa_only(platform_url: str, token: str, challenge_id: str) -> bool:
+async def _detect_qa_only(platform_url: str, token: str, challenge_id: str) -> bool:
     """Read is_qa_only from the raw challenge (the domain model drops it). Dev
     helper to pick run_mode; best-effort, never raises."""
     import httpx
 
     base = platform_url.rstrip("/") + "/api/v1"
     try:
-        with httpx.Client(
+        async with httpx.AsyncClient(
             timeout=30, headers={"Authorization": f"Bearer {token}"}
         ) as c:
-            r = c.get(f"{base}/challenges/{challenge_id}")
+            r = await c.get(f"{base}/challenges/{challenge_id}")
             if r.status_code == 200:
                 return bool(r.json().get("is_qa_only"))
     except Exception:
@@ -688,12 +693,10 @@ async def _run_integration(
     finally:
         result.input_tokens = llm.input_tokens
         result.output_tokens = llm.output_tokens
-        CtfyResultSink(result_path, stdout_fallback=False).write(result)
-        for c in (plat_client, gw_client):
-            try:
-                await c.aclose()
-            except Exception:
-                pass
+        try:
+            CtfyResultSink(result_path, stdout_fallback=False).write(result)
+        finally:
+            await close_ports(plat_client, gw_client)
 
     probes = {
         "platform": platform,
@@ -716,7 +719,7 @@ async def _run_integration(
 
 async def _run_solve(
     result_path: str, t0: float, competition_override: str | None,
-    secret_env_path: str, timeout_s: float,
+    secret_env_path: str, timeout_s: float | None,
     challenge_id: str | None = None, max_turns: int | None = None,
 ) -> tuple[RunResult, dict[str, Any]]:
     import httpx
@@ -729,14 +732,28 @@ async def _run_solve(
     from agent.briefing import load_task
     from agent.config import Settings
     from agent.domain.coordinator import Coordinator
-    from agent.domain.state import RunMode, Task
+    from agent.domain.state import RunMode
 
     _load_secret_env(secret_env_path)
     settings = Settings.from_env()
-    if competition_override:
-        settings = replace(settings, competition_id=competition_override)
+    total_limit = (
+        timeout_s if timeout_s is not None else
+        settings.max_wall_s if settings.max_wall_s is not None else 1800.0
+    )
+    work_limit, shutdown_grace = split_timeout(total_limit)
+    settings = replace(
+        settings, competition_id=competition_override or settings.competition_id,
+        max_wall_s=work_limit,
+    )
     cid = settings.competition_id
-
+    task = load_task(settings)
+    if max_turns is not None:
+        task = replace(task, max_turns=max_turns)
+    task_tokens = task.limits.get("max_tokens")
+    settings = replace(
+        settings, max_turns=task.max_turns,
+        max_tokens=task_tokens if isinstance(task_tokens, int) else settings.max_tokens,
+    )
     clock = CountingClock(RealClock())
     plat_transport = _make_counting_transport()
     plat_client = httpx.AsyncClient(transport=plat_transport, timeout=30)
@@ -744,13 +761,11 @@ async def _run_solve(
     gw_client = httpx.AsyncClient(
         base_url=settings.llm_base_url, transport=gw_transport, timeout=60
     )
-
     platform = CountingPlatform(
         CtfyRestAdapter(
             settings.platform_url, settings.token,
             clock=clock, competition_id=cid, client=plat_client,
-        ),
-        t0=t0,
+        ), t0=t0,
     )
     llm = CountingLLM(
         GatewayAdapter(
@@ -758,91 +773,87 @@ async def _run_solve(
             clock=clock, client=gw_client,
         )
     )
-
-    # Dev-targeted single-challenge solve: pin the run to one challenge and stage
-    # its attachments into the agent's per-challenge workspace (<root>/<cid>/),
-    # which is exactly where SubprocessAdapter.new_workspace() lands, so the
-    # agent's shell sees the files. This mirrors image-mode's /ctfy/work staging
-    # without touching any frozen contract — it's dev plumbing in the harness.
-    solve_notes: list[str] = []
-    work_root: str | None = None
-    qa_only = False
-    if challenge_id:
-        import tempfile
-
-        work_root = tempfile.mkdtemp(prefix="solve-")
-        staged = _stage_attachments(
-            settings.platform_url, settings.token, challenge_id, work_root
-        )
-        # The platform tells image-mode the run_mode via task.json; dev must
-        # mirror it. A qa_only challenge has no instance, so run it in QA mode —
-        # else the coordinator tries to start an instance and 4xx's. The domain
-        # Challenge model doesn't carry is_qa_only, so read it from the raw API.
-        qa_only = _detect_qa_only(
-            settings.platform_url, settings.token, challenge_id
-        )
-        inst_staged: list[str] = []
-        if not qa_only:
-            # Instance challenges keep the real per-team artifact on the running
-            # instance, not in challenge attachments; mirror image-mode staging.
-            inst_staged = _stage_instance_attachments(
-                settings.platform_url, settings.token, challenge_id, cid, work_root
-            )
-        solve_notes.append(
-            f"targeted solve of {challenge_id}; staged attachments: "
-            f"{staged or 'none'}; instance attachments: {inst_staged or 'none'}; "
-            f"qa_only={qa_only}"
-        )
-
-    execution = CountingExecution(SubprocessAdapter(root=work_root))
-    sink = CtfyResultSink(result_path, stdout_fallback=True)
-
+    execution = CountingExecution(SimpleNamespace())
+    sink = CtfyResultSink(result_path, stdout_fallback=False)
     result = RunResult(stop_reason="not_started")
-    notes: list[str] = list(solve_notes)
+    coord = None
+    notes: list[str] = []
+    selected: list[Challenge] = []
+    loop = asyncio.get_running_loop()
+    work_started = loop.time()
     try:
-        # Build the task INSIDE the guarded block so a transient platform error
-        # while fetching the target (e.g. a 503) is caught and still writes a
-        # result — it's an infra blip, not an agent failure or a runner crash.
-        if challenge_id:
-            ch_obj = await platform.get_challenge(challenge_id)
-            task = Task(
-                run_mode=RunMode.QA if qa_only else RunMode.INSTANCE,
-                challenge=ch_obj, competition_id=cid, max_turns=max_turns,
-                result_path=result_path, stdout_fallback=True,
+        if work_limit is not None and work_limit <= 0:
+            raise TimeoutError
+        # Async staging and solving share one deadline; cancellation leaves no
+        # background HTTP thread running after result persistence and cleanup.
+        async with asyncio.timeout(work_limit):
+            work_root = tempfile.mkdtemp(prefix="solve-") if challenge_id else None
+            execution = CountingExecution(SubprocessAdapter(root=work_root))
+            if challenge_id:
+                staged = await _stage_attachments(
+                    settings.platform_url, settings.token, challenge_id, work_root
+                )
+                qa_only = await _detect_qa_only(
+                    settings.platform_url, settings.token, challenge_id
+                )
+                inst_staged = [] if qa_only else await _stage_instance_attachments(
+                    settings.platform_url, settings.token, challenge_id, cid, work_root
+                )
+                notes.append(
+                    f"targeted solve of {challenge_id}; staged attachments: "
+                    f"{staged or 'none'}; instance attachments: {inst_staged or 'none'}; "
+                    f"qa_only={qa_only}"
+                )
+                ch_obj = await platform.get_challenge(challenge_id)
+                selected.append(ch_obj)
+                task = replace(
+                    task, run_mode=RunMode.QA if qa_only else RunMode.INSTANCE,
+                    challenge=ch_obj, competition_id=cid,
+                )
+            remaining = (
+                None if work_limit is None
+                else max(0.0, work_limit - (loop.time() - work_started))
             )
-        else:
-            task = load_task(settings)
-        coord = Coordinator(
-            platform, llm, execution, sink, clock=clock, task=task, settings=settings
-        )
-        result = await asyncio.wait_for(coord.run(), timeout=timeout_s)
+            coord = Coordinator(
+                platform, llm, execution, sink, clock=clock, task=task,
+                settings=replace(settings, max_wall_s=remaining),
+            )
+            result = await coord.run()
     except TimeoutError:
-        notes.append(f"solve timed out after {timeout_s}s (bounded by --timeout)")
-        result = RunResult(stop_reason="timeout")
-    except Exception as e:  # noqa: BLE001 - 任何失败都写记录、不崩
-        notes.append(f"solve error: {type(e).__name__}: {e}")
-        result = RunResult(stop_reason=f"error: {type(e).__name__}")
+        notes.append(f"solve timed out after {work_limit}s work budget")
+        result = coord.current_result if coord is not None else result
+        result.stop_reason = "timeout"
+    except asyncio.CancelledError:
+        result = coord.current_result if coord is not None else result
+        result.stop_reason = "cancelled"
+        raise
+    except Exception as error:  # noqa: BLE001 - retain progress on every failure
+        notes.append(f"solve error: {type(error).__name__}: {error}")
+        result = coord.current_result if coord is not None else result
+        result.stop_reason = f"error: {type(error).__name__}"
     finally:
         try:
-            await close_ports(execution, plat_client, gw_client)
-        finally:
             sink.write(result)
-
-    # 竞赛暂停：若出现 PAUSED 判定，在记录里标注（不视为错误）。
+        finally:
+            await close_ports(
+                execution, plat_client, gw_client, timeout_s=shutdown_grace
+            )
     paused = platform.verdict_counts().get(VerdictStatus.PAUSED.value, 0)
     if paused:
         notes.append(f"competition_paused seen {paused} time(s); handled as PAUSED, not error")
-
     probes = {
-        "platform": platform,
-        "llm": llm,
-        "execution": execution,
-        "clock": clock,
-        "http": plat_transport,
-        "gateway_http": gw_transport,
-        "settings": settings,
-        "challenges": platform.listed_challenges,
-        "notes": notes,
+        "platform": platform, "llm": llm, "execution": execution, "clock": clock,
+        "http": plat_transport, "gateway_http": gw_transport, "settings": settings,
+        "challenges": [
+            platform.fetched_challenges.get(ch.id, ch)
+            for ch in selected or platform.listed_challenges
+        ], "notes": notes,
+        "selected_challenge_ids": (
+            [challenge_id] if challenge_id else
+            [task.challenge.id] if task.challenge is not None else
+            sorted(ch.id for ch in platform.listed_challenges)
+        ),
+        "total_wall_limit_s": total_limit,
     }
     return result, probes
 
@@ -1064,7 +1075,7 @@ def _assemble_record(
 
     # --- budget --------------------------------------------------------------
     tokens_total = result.input_tokens + result.output_tokens
-    _mt = getattr(settings, "max_turns", None)
+    _mt = getattr(settings, "max_turns", None) if mode != "integration" else None
     max_turns = _mt if isinstance(_mt, int) else None
     # Amortizing tokens over solves is meaningless with zero solves (e.g. the
     # read-only integration mode); leave it None so the comparison SKIPs it
@@ -1102,13 +1113,35 @@ def _assemble_record(
             "competition_title": None,  # 冻结的 /me 端口只回 Account(id,name)，暂无赛事名
             "account_id": getattr(platform.account, "id", None),
             "account_name": getattr(platform.account, "name", None),
-            "model": getattr(settings, "llm_model", "") or None,
+            "model": getattr(settings, "llm_model", "") or (
+                "glm-4.6" if mode == "integration" else "default"
+            ),
             "llm_flavor": getattr(settings, "llm_flavor", "") or None,
             "llm_base_host": _host_only(getattr(settings, "llm_base_url", "") or ""),
             "agent_version": getattr(agent, "__version__", ""),
             "python": _platform.python_version(),
             "platform": _platform.platform(),
             "dry_run": bool(getattr(settings, "dry_run", False)),
+            "comparison_identity": {
+                "version": 1,
+                "mode": mode,
+                "challenge_ids": sorted(set(
+                    probes.get("selected_challenge_ids", [ch.id for ch in challenges])
+                )),
+                "model": getattr(settings, "llm_model", "") or (
+                    "glm-4.6" if mode == "integration" else "default"
+                ),
+                "llm_flavor": getattr(settings, "llm_flavor", "") or None,
+                "llm_base_host": _host_only(getattr(settings, "llm_base_url", "") or ""),
+                "max_turns": max_turns if mode != "integration" else None,
+                "max_tokens": (
+                    getattr(settings, "max_tokens", None) if mode != "integration" else None
+                ),
+                "max_wall_s": (
+                    getattr(settings, "max_wall_s", None) if mode != "integration" else None
+                ),
+                "total_wall_limit_s": probes.get("total_wall_limit_s"),
+            },
         },
         "timing": {
             "total_wall_s": round(total_wall_s, 6),
@@ -1154,6 +1187,9 @@ def _assemble_record(
         "budget": {
             "turns_used": result.turns,
             "max_turns": max_turns,
+            "max_tokens": getattr(settings, "max_tokens", None) if mode != "integration" else None,
+            "max_wall_s": getattr(settings, "max_wall_s", None) if mode != "integration" else None,
+            "total_wall_limit_s": probes.get("total_wall_limit_s"),
             "tokens_input": result.input_tokens,
             "tokens_output": result.output_tokens,
             "tokens_total": tokens_total,
@@ -1233,6 +1269,61 @@ def _dget(obj: dict[str, Any], dotted: str) -> Any:
     return cur
 
 
+def _qualification_errors(record: dict[str, Any]) -> list[str]:
+    """A baseline must be a successful, audited run in its own mode."""
+    errors: list[str] = []
+    identity = _dget(record, "meta.comparison_identity")
+    fields = {
+        "version", "mode", "challenge_ids", "model", "llm_flavor", "llm_base_host",
+        "max_turns", "max_tokens", "max_wall_s", "total_wall_limit_s",
+    }
+    if (
+        not isinstance(identity, dict)
+        or not fields <= identity.keys()
+        or identity.get("version") != 1
+    ):
+        errors.append("comparison identity missing/unsupported; regenerate baseline")
+    raw_mode = _dget(record, "meta.mode")
+    mode = raw_mode if isinstance(raw_mode, str) else None
+    if mode not in {"smoke", "solve", "integration"}:
+        errors.append("unsupported mode")
+    if isinstance(identity, dict) and identity.get("mode") != mode:
+        errors.append("comparison identity mode mismatch")
+    required = {
+        "stability.exit_code": 0,
+        "stability.result_json_written": True,
+        "stability.result_json_valid": True,
+        "stability.exceptions": 0,
+        "artifact.required_fields_present": True,
+        "artifact.answers_solved_consistent": True,
+        "artifact.no_secret_leak": True,
+    }
+    for path, expected in required.items():
+        actual = _dget(record, path)
+        if type(actual) is not type(expected) or actual != expected:
+            errors.append(f"unsuccessful run: {path}")
+    reason = _dget(record, "stability.stop_reason")
+    if (
+        not isinstance(reason, str)
+        or reason in {"timeout", "cancelled", "not_started"}
+        or "error" in reason
+    ):
+        errors.append("unsuccessful stop reason")
+    if mode == "integration":
+        if reason != "integration_ok":
+            errors.append("integration probe did not succeed")
+    elif mode in {"smoke", "solve"}:
+        score = _dget(record, "solving.questions_solved")
+        rate = _dget(record, "solving.solve_rate")
+        if type(score) is not int or score <= 0:
+            errors.append("zero/invalid solve count")
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 < rate <= 1:
+            errors.append("zero/invalid solve rate")
+        if not isinstance(identity, dict) or not identity.get("challenge_ids"):
+            errors.append("empty challenge cohort")
+    return errors
+
+
 def _compare(
     record: dict[str, Any], baseline: dict[str, Any], thresholds: dict[str, Any]
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -1245,6 +1336,27 @@ def _compare(
         order = {"PASS": 0, "WARN": 1, "FAIL": 2}
         if order[level] > order[overall]:
             overall = level
+
+    # A malformed/legacy/unlike baseline must never silently turn into SKIP.
+    for label, candidate in (("current", record), ("baseline", baseline)):
+        for detail in _qualification_errors(candidate):
+            rows.append({
+                "metric": f"qualification:{label}", "current": False,
+                "baseline": True, "level": "FAIL", "kind": "qualification",
+                "detail": detail,
+            })
+            _bump("FAIL")
+    identity = _dget(record, "meta.comparison_identity")
+    if identity != _dget(baseline, "meta.comparison_identity"):
+        rows.append({
+            "metric": "comparison_identity", "current": identity,
+            "baseline": _dget(baseline, "meta.comparison_identity"),
+            "level": "FAIL", "kind": "qualification",
+            "detail": "incompatible cohort/model/effective budgets; regenerate baseline",
+        })
+        _bump("FAIL")
+    if overall == "FAIL":
+        return overall, rows
 
     # 红线（与基线无关，看本次记录本身）
     redline_checks = {
@@ -1302,7 +1414,12 @@ def _print_comparison(
 ) -> None:
     print("\n=== 回归比对（与基线） ===")
     if base_mode and base_mode != cur_mode:
-        print(redact(f"  ! 基线档位({base_mode}) 与本次({cur_mode}) 不一致——比对仅供参考。"))
+        print(
+            redact(
+                f"  ! 基线档位({base_mode}) 与本次({cur_mode}) 不一致"
+                "——拒绝比对，请重新生成基线。"
+            ),
+        )
     for r in rows:
         mark = {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL", "SKIP": "skip"}[r["level"]]
         line = f"  [{mark}] {r['metric']}: 本次={r['current']} 基线={r['baseline']}"
@@ -1501,13 +1618,15 @@ def _render_outputs(
             outputs[trace_path] = trace
             print(f"[regression] 轨迹已写入: {redact(trace_path)}")
             print(trace)
-        if args.save_baseline:
-            outputs[baseline_path] = payload
+        if record["meta"].get("comparison_status") is not None:
+            _print_comparison(
+                record["meta"]["comparison_status"],
+                record["meta"].get("comparison_details", []),
+                _dget(baseline, "meta.mode") if baseline else None, args.mode,
+            )
+        if args.save_baseline and record["stability"]["exit_code"] == 0:
             print(f"[regression] 已另存基线: {redact(baseline_path)}")
-        elif baseline is not None:
-            overall, rows = _compare(record, baseline, thresholds)
-            _print_comparison(overall, redact_data(rows), _dget(baseline, "meta.mode"), args.mode)
-        else:
+        elif baseline is None and not args.save_baseline:
             print(
                 f"[regression] 未找到基线 {redact(baseline_path)}"
                 " —— 用 --save-baseline 存一个基线。"
@@ -1527,6 +1646,7 @@ def _stage_candidates(outputs: dict[str, str]) -> dict[str, str]:
     candidates: dict[str, str] = {}
     try:
         for path, text in outputs.items():
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             fd, temporary = tempfile.mkstemp(
                 prefix=".regression-", suffix=".tmp", dir=os.path.dirname(path) or ".",
             )
@@ -1569,7 +1689,8 @@ def main() -> int:
     p.add_argument("--save-baseline", action="store_true", help="把本次记录另存为基线")
     p.add_argument("--secret-env", default=os.path.join(_REPO_ROOT, "docs", "secret.env"),
                    help="integration/solve 读取的凭据文件（KEY=value）")
-    p.add_argument("--timeout", type=float, default=1800.0, help="solve 模式整体墙钟上限（秒）")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="solve 整体墙钟上限（秒；CLI > CTFY_AGENT_MAX_WALL_S > 1800）")
     p.add_argument("--challenge", default=None,
                    help="solve 档只做这一道题（dev 定向；附件会预拉到 agent 工作区）")
     p.add_argument("--max-turns", type=int, default=None,
@@ -1682,36 +1803,75 @@ def main() -> int:
     stdout = redact(dispatch_stdout.getvalue())
     candidates: dict[str, str] = {}
     try:
+        baseline_error = None
         if not args.save_baseline and os.path.exists(baseline_path):
-            with open(baseline_path, encoding="utf-8") as stream:
-                baseline = redact_data(json.load(stream))
+            try:
+                with open(baseline_path, encoding="utf-8") as stream:
+                    baseline = redact_data(json.load(stream))
+                if not isinstance(baseline, dict):
+                    raise ValueError("baseline must be a JSON object")
+            except Exception as error:
+                baseline = {}
+                baseline_error = redact(f"baseline read failed: {type(error).__name__}: {error}")
             thr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "thresholds.json")
             with open(thr_path, encoding="utf-8") as stream:
                 thresholds = json.load(stream)
         result_safe = _audit_outputs([result_path], stdout=stdout, stderr=stderr)
         eligible = result_safe and record["stability"]["result_json_valid"] and not redaction_failed
-        record["artifact"]["no_secret_leak"] = False
+        record["artifact"]["no_secret_leak"] = bool(eligible)
         if not eligible:
             exit_code = 1
-            record["stability"]["exit_code"] = exit_code
+        record["stability"]["exit_code"] = exit_code
+        if baseline is not None:
+            overall, rows = _compare(record, baseline, thresholds)
+        else:
+            errors = _qualification_errors(record)
+            overall = "FAIL" if errors else "PASS"
+            rows = [
+                {"metric": "qualification:current", "level": "FAIL",
+                 "kind": "qualification", "current": False, "baseline": True,
+                 "detail": detail} for detail in errors
+            ]
+        if baseline_error is not None:
+            rows.append({
+                "metric": "baseline:read", "level": "FAIL", "kind": "qualification",
+                "current": False, "baseline": True, "detail": baseline_error,
+            })
+            overall = "FAIL"
+        record["meta"]["comparison_status"] = overall
+        record["meta"]["comparison_details"] = redact_data(rows)
+        if overall == "FAIL":
+            exit_code = 1
+        record["stability"]["exit_code"] = exit_code
 
-        def stage() -> tuple[dict[str, str], str]:
+        def stage(snapshot: dict[str, Any]) -> tuple[dict[str, str], str]:
             return _render_outputs(
-                record, probes, args, record_path=record_path, table_path=table_path,
+                snapshot, probes, args, record_path=record_path, table_path=table_path,
                 trace_path=trace_path, baseline_path=baseline_path, baseline=baseline,
                 thresholds=thresholds, dispatch_stdout=stdout,
             )
 
-        # All formal outputs remain explicitly unverified until the complete
-        # manifest and the exact green candidate bytes have passed the audit.
-        record["stability"]["exit_code"] = 1
-        false_outputs, _ = stage()
+        # Safety snapshots NEVER include the baseline. Compare only the intended
+        # final record; a pending audit is not a regression measurement.
+        safety_record = {
+            **record,
+            "artifact": {**record["artifact"], "no_secret_leak": False},
+            "stability": {**record["stability"], "exit_code": 1},
+            "meta": {**record["meta"], "comparison_status": "FAIL",
+                     "comparison_details": [{
+                         "metric": "publication", "level": "FAIL", "kind": "redline",
+                         "current": False, "baseline": True,
+                         "detail": "audit/publication not committed",
+                     }]},
+        }
+        false_outputs, _ = stage(safety_record)
         _write_outputs(false_outputs)
-        record["artifact"]["no_secret_leak"] = bool(eligible)
-        record["stability"]["exit_code"] = exit_code
-        outputs, terminal = stage()
+        outputs, terminal = stage(record)
+        promote_baseline = args.save_baseline and exit_code == 0
+        if promote_baseline:
+            outputs[baseline_path] = json.dumps(record, ensure_ascii=False, indent=2)
         candidates = _stage_candidates(outputs)
-        json_destinations = (record_path, *((baseline_path,) if args.save_baseline else ()))
+        json_destinations = (record_path, *((baseline_path,) if promote_baseline else ()))
         final_safe = _audit_outputs(
             [result_path, *false_outputs, *candidates.values()],
             stdout=terminal, stderr=stderr,
@@ -1719,11 +1879,16 @@ def main() -> int:
                         *(candidates[path] for path in json_destinations)),
         )
         if not final_safe or not eligible:
-            # No true report has touched a formal path. Do not rely on rollback
-            # writes to revoke a green claim after disk failure or interruption.
             print(redact("[regression] 安全审计失败：产物缺失、无效或包含凭证。"), file=sys.stderr)
             return 1
-        _publish_candidates(candidates, record_path=record_path)
+        # Publish every run artifact, including the record commit marker, BEFORE
+        # the separately staged baseline gets its single atomic replacement.
+        _publish_candidates(
+            {path: temporary for path, temporary in candidates.items() if path != baseline_path},
+            record_path=record_path,
+        )
+        if promote_baseline:
+            os.replace(candidates[baseline_path], baseline_path)
     except Exception as error:
         print(
             redact(f"[regression] 输出/安全审计失败: {type(error).__name__}: {error}"),

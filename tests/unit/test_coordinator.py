@@ -3,6 +3,8 @@ RunResult (it never solves a challenge itself, and never crashes the run)."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -252,3 +254,112 @@ async def test_zero_turn_budget_starts_no_model_or_instance(clock):
     assert not result.fully_solved
     assert result.turns == 0
     assert llm.calls == []
+
+
+class SnapshotSink(RecordingResultSink):
+    def __init__(self):
+        super().__init__()
+        self.snapshots = []
+
+    def write(self, result):
+        super().write(result)
+        self.snapshots.append(asdict(result))
+
+
+async def test_verified_progress_is_saved_before_the_next_model_call(clock):
+    challenge = make_challenge(questions=[Question("q1"), Question("q2")])
+    sink = SnapshotSink()
+
+    def respond(_messages):
+        if len(llm.calls) == 1:
+            return LLMResponse(
+                tool_calls=[ToolCall("submit_flag", {"flag": "A", "question_id": "q1"})],
+                input_tokens=7, output_tokens=3,
+            )
+        assert any(
+            snapshot["answers"] == {"q1": "A"}
+            and snapshot["turns"] == 1
+            and snapshot["input_tokens"] == 7
+            for snapshot in sink.snapshots
+        )
+        return LLMResponse(
+            tool_calls=[ToolCall("submit_flag", {"flag": "B", "question_id": "q2"})],
+            input_tokens=11, output_tokens=5,
+        )
+
+    llm = FakeLLM(respond)
+    platform = FakePlatform(
+        [challenge], answers={("c1", "q1"): "A", ("c1", "q2"): "B"}
+    )
+    coord = Coordinator(
+        platform, llm, FakeExecution(), sink, clock=clock,
+        task=Task(run_mode=RunMode.QA, challenge=challenge, max_turns=2),
+    )
+
+    result = await coord.run()
+
+    assert result.fully_solved
+    assert result.answers == {"q1": "A", "q2": "B"}
+    assert result.turns == 2
+    assert result.input_tokens == 18
+    assert result.output_tokens == 8
+    assert all(snapshot["turns"] <= 2 for snapshot in sink.snapshots)
+    assert sink.snapshots[-1]["fully_solved"] is True
+
+
+async def test_cancellation_preserves_verified_answers_and_usage(clock):
+    challenge = make_challenge(questions=[Question("q1"), Question("q2")])
+    entered_second_call = asyncio.Event()
+    sink = SnapshotSink()
+
+    class PausingModel:
+        calls = 0
+
+        async def complete(self, messages, *, model, effort="medium", tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    tool_calls=[ToolCall("submit_flag", {"flag": "A", "question_id": "q1"})],
+                    input_tokens=7, output_tokens=3,
+                )
+            entered_second_call.set()
+            await asyncio.Event().wait()
+
+    coord = Coordinator(
+        FakePlatform([challenge], answers={("c1", "q1"): "A"}),
+        PausingModel(), FakeExecution(), sink, clock=clock,
+        task=Task(run_mode=RunMode.QA, challenge=challenge, max_turns=3),
+    )
+    run = asyncio.create_task(coord.run())
+    await entered_second_call.wait()
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    assert coord.current_result.answers == {"q1": "A"}
+    assert coord.current_result.turns == 2
+    assert coord.current_result.input_tokens == 7
+    assert coord.current_result.output_tokens == 3
+    assert sink.snapshots[-1]["answers"] == {"q1": "A"}
+    assert sink.snapshots[-1]["fully_solved"] is False
+
+
+async def test_wall_deadline_bounds_instance_readiness_wait(clock):
+    challenge = make_challenge()
+
+    class StartingPlatform(FakePlatform):
+        async def start_instance(self, cid):
+            return Instance(cid, status=InstanceStatus.STARTING, poll_after_s=4)
+
+    llm = FakeLLM()
+    sink = SnapshotSink()
+    result = await Coordinator(
+        StartingPlatform([challenge]), llm, FakeExecution(), sink, clock=clock,
+        settings=SimpleNamespace(max_wall_s=5),
+    ).run()
+
+    assert clock.now() == 5
+    assert result.stop_reason == "timeout"
+    assert result.answers == {}
+    assert llm.calls == []
+    assert sink.snapshots[-1]["stop_reason"] == "timeout"

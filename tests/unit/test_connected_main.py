@@ -1,8 +1,10 @@
 """Connected CLI failures produce safe diagnostics and a usable result artifact."""
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+from argparse import Namespace
 
 import pytest
 
@@ -83,3 +85,44 @@ def test_argument_error_does_not_echo_known_credential(tmp_path, monkeypatch, ca
     assert connected_main.main() == 2
     captured = capsys.readouterr()
     assert secret not in captured.out + captured.err
+
+
+async def test_connected_cancellation_preserves_partial_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agent.config.os.environ",
+        {"CTFY_WORK_DIR": str(tmp_path), "CTFY_EVAL_MAX_TURNS": "3"},
+    )
+    challenge = Challenge(
+        "c1", questions=[Question("q1", fmt="single"), Question("q2", fmt="single")]
+    )
+    entered = asyncio.Event()
+
+    class PausingModel:
+        calls = 0
+
+        async def complete(self, messages, *, model, effort="medium", tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return LLMResponse(
+                    tool_calls=[ToolCall("submit_flag", {"flag": "A", "question_id": "q1"})],
+                    input_tokens=7, output_tokens=3,
+                )
+            entered.set()
+            await asyncio.Event().wait()
+
+    w = Wiring(
+        FakePlatform([challenge], answers={("c1", "q1"): "A"}),
+        PausingModel(), FakeExecution(), RecordingResultSink(), FakeClock(),
+    )
+    monkeypatch.setattr(connected_main, "build_for_dev", lambda _settings: w)
+    run = asyncio.create_task(connected_main._run(Namespace(challenge="c1")))
+    await entered.wait()
+    run.cancel()
+    result = await run
+
+    saved = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result.answers == saved["answers"] == {"q1": "A"}
+    assert saved["turns"] == 2
+    assert saved["input_tokens"] == 7
+    assert saved["output_tokens"] == 3
+    assert saved["fully_solved"] is False

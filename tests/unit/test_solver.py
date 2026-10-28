@@ -88,52 +88,78 @@ def test_policy_should_stop_on_stall():
     assert policy.should_stop(Budget(), 3, stall_limit=3) is True
 
 
-def test_cmd_fingerprint_collapses_superficial_variants():
-    from agent.domain.solver import _cmd_fingerprint
+@pytest.mark.parametrize(
+    "mode", ["growing_log", "script_revisions", "write_only", "stderr_changes"],
+)
+async def test_same_command_can_make_progress(clock, mode):
+    ch = make_challenge()
+    polls = 0
 
-    def fp(cmd):
-        return _cmd_fingerprint(ToolCall("execute", {"cmd": cmd}))
+    def run(cmd):
+        nonlocal polls
+        if cmd != "python solve.py":
+            return ExecResult()
+        polls += 1
+        # Novelty occurs well after the old 400-character prefix. Script edits
+        # also count when the rerun itself still prints the same diagnostic.
+        if mode == "script_revisions":
+            return ExecResult(stdout="same diagnostic")
+        if mode == "stderr_changes":
+            return ExecResult(stdout="same stdout", stderr="prefix " * 100 + f"\nprogress {polls}")
+        return ExecResult(stdout="prefix " * 100 + f"\nprogress {polls}")
 
-    # cosmetic variants (flags, absolute path, trailing echo) collapse to one key
-    assert fp("cat flag.txt") == fp("cat -n flag.txt")
-    assert fp("cat flag.txt") == fp("cat /tmp/ws/flag.txt")
-    # genuinely different work keeps a different fingerprint
-    assert fp("ls -la") != fp("cat flag.txt")
-    assert fp("cat a.txt") != fp("cat b.txt")
-    # non-execute tools fingerprint by name
-    assert _cmd_fingerprint(ToolCall("submit_flag", {"flag": "x"})) == "submit_flag"
-
-
-async def test_doom_loop_of_repeated_commands_stalls(clock):
-    # A doom-loop hides behind superficial command variation: the model re-reads
-    # the same file with cosmetically different commands, and the environment
-    # returns fresh output each turn — so output-novelty alone never trips. The
-    # command-fingerprint stall must still stop it well before the turn budget.
-    ch = make_challenge("c1", n_questions=1)
-    platform = FakePlatform([ch], verdicts=VerdictStatus.WRONG)
-
-    n = {"i": 0}
-
-    def novel_each_time(_cmd):
-        n["i"] += 1
-        return ExecResult(stdout=f"unique-output-{n['i']}")  # always "novel"
-
-    variants = ["cat flag.txt", "cat -n flag.txt", "cat /tmp/ws/flag.txt"]
-    k = {"i": 0}
-
-    def loop(_messages):
-        cmd = variants[k["i"] % len(variants)]
-        k["i"] += 1
-        return LLMResponse(tool_calls=[ToolCall("execute", {"cmd": cmd})])
-
+    execution = FakeExecution(run)
+    turns = []
+    for step in range(18):
+        if mode in ("script_revisions", "write_only"):
+            turns.append(LLMResponse(tool_calls=[ToolCall("write_file", {
+                "path": "solve.py", "content": f"print({step})\n",
+            })]))
+        if mode != "write_only":
+            turns.append(LLMResponse(tool_calls=[ToolCall("execute", {"cmd": "python solve.py"})]))
+    turns.append(_submit_flag("ctfy{done}")([]))
     solver = ReActSolver(
-        FakeLLM(loop), FakeExecution(novel_each_time), platform, MessageBus(),
+        FakeLLM(turns), execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=len(turns)),
+    )
+    assert await solver.solve(ch) is RunStatus.SOLVED
+    assert polls == (0 if mode == "write_only" else 18)
+    if mode in ("script_revisions", "write_only"):
+        assert execution.files["/ws/c1/solve.py"] == b"print(17)\n"
+
+
+async def test_unchanged_repeated_observations_stop(clock):
+    ch = make_challenge()
+    llm = FakeLLM(lambda _: LLMResponse(
+        tool_calls=[ToolCall("execute", {"cmd": "cat out.log"})],
+    ))
+    execution = FakeExecution({"cat out.log": ExecResult(stdout="unchanged")})
+    solver = ReActSolver(
+        llm, execution, FakePlatform([ch]), MessageBus(),
         model="m", clock=clock, budget=Budget(max_turns=50),
     )
-    status = await solver.solve(ch)
-    assert status is RunStatus.GIVEN_UP
-    assert solver.turns < 50  # stall stopped it, not the turn budget
-    assert solver.turns <= 15  # ~ stall_limit (12) + a couple, not a 50-turn spin
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP
+    assert solver.turns < 50
+    assert execution.commands.count("cat out.log") < 50
+
+
+async def test_real_observations_reset_nonconsecutive_stalls(clock):
+    ch = make_challenge()
+    responses = []
+    outputs = {}
+    for stage in range(4):
+        cmd = f"stage-{stage}"
+        outputs[cmd] = ExecResult(stdout=f"new evidence {stage}")
+        responses.extend([
+            LLMResponse(tool_calls=[ToolCall("execute", {"cmd": cmd})])
+            for _ in range(7)
+        ])
+    responses.append(_submit_flag("ctfy{done}")([]))
+    solver = ReActSolver(
+        FakeLLM(responses), FakeExecution(outputs), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=len(responses)),
+    )
+    assert await solver.solve(ch) is RunStatus.SOLVED
 
 
 class RoutedPlatform(FakePlatform):
@@ -567,3 +593,364 @@ def test_looks_like_flag_rejects_structural_text():
     assert not policy.looks_like_flag('siteConfig(key:"flag"){id}')  # quotes/parens
     assert not policy.looks_like_flag("obj{a{b}}")                   # nested braces
     assert not policy.looks_like_flag("f{a b}")                      # inner space
+
+
+async def test_partial_plan_and_source_notes_survive_history_window(clock):
+    ch = make_challenge()
+    literal = "`__key**__`"
+    responses = [
+        LLMResponse(
+            text=(
+                "HYPOTHESIS: verify /api/key\n"
+                "RULED OUT: /admin denied\n"
+                f"EVIDENCE: cat params.txt offset 900 => {literal}\n"
+                "[ ] decode params"
+            ),
+            tool_calls=[ToolCall("execute", {"cmd": "read-params"})],
+        ),
+        LLMResponse(
+            text="[x] decoded params\n[ ] verify key",
+            tool_calls=[ToolCall("execute", {"cmd": "decode"})],
+        ),
+    ]
+    responses.extend(
+        LLMResponse(tool_calls=[ToolCall("execute", {"cmd": f"probe-{i}"})])
+        for i in range(8)
+    )
+    responses.append(_submit_flag("ctfy{verified}")([]))
+    llm = FakeLLM(responses)
+    solver = ReActSolver(
+        llm, FakeExecution(), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=len(responses)),
+    )
+    assert await solver.solve(ch) is RunStatus.SOLVED
+    context = llm.calls[-1]["messages"][-1].content
+    assert "$ read-params" not in context
+    assert "HYPOTHESIS: verify /api/key" in context
+    assert "RULED OUT: /admin denied" in context
+    assert f"EVIDENCE: cat params.txt offset 900 => {literal}" in context
+    assert "[x] decoded params" in context
+    assert "[ ] verify key" in context
+
+
+async def test_clipped_middle_output_is_retrievable_from_artifact(clock):
+    ch = make_challenge()
+    middle = "RECOVERABLE_MIDDLE: key=__ab**cd__\n"
+    stdout = "a" * 3400 + middle + "z" * 2200
+    stderr = "e" * 3400 + "RECOVERABLE_ERROR_DETAIL" + "r" * 2200
+    execution = FakeExecution({
+        "dump": ExecResult(stdout=stdout, stderr=stderr, truncated=True),
+    })
+    llm = FakeLLM([
+        LLMResponse(tool_calls=[ToolCall("execute", {"cmd": "dump"})]),
+        LLMResponse(tool_calls=[ToolCall("execute", {"cmd": "small"})]),
+        LLMResponse(),
+    ])
+    solver = ReActSolver(
+        llm, execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=3),
+    )
+    await solver.solve(ch)
+    context = llm.calls[1]["messages"][-1].content
+    assert middle not in context
+    assert "RECOVERABLE_ERROR_DETAIL" not in context
+    for stream, text in (("stdout", stdout), ("stderr", stderr)):
+        path = next(
+            line.removeprefix(f"{stream}: ")
+            for line in context.splitlines()
+            if line.startswith(f"{stream}: /ws/")
+        )
+        assert await execution.read_file(path) == text.encode("utf-8")
+        assert context.index(path) > context.rindex("<clipped")
+    assert "adapter-discarded bytes are unavailable" in context
+    # Older history compression also keeps the retrievable paths.
+    older = llm.calls[2]["messages"][-1].content
+    assert path in older
+
+
+async def test_output_artifact_slots_rotate_and_small_output_needs_none(clock):
+    ch = make_challenge()
+    execution = FakeExecution({
+        **{f"large-{i}": ExecResult(stdout=str(i) * 6000) for i in range(7)},
+        "small": ExecResult(stdout="small"),
+    })
+    responses = [
+        LLMResponse(tool_calls=[ToolCall("execute", {"cmd": cmd})])
+        for cmd in ["small", *(f"large-{i}" for i in range(7))]
+    ]
+    llm = FakeLLM(responses)
+    solver = ReActSolver(
+        llm, execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=len(responses)),
+    )
+    await solver.solve(ch)
+    assert len(execution.files) == 8
+    assert all("/.solver-output/" in path for path in execution.files)
+    assert sorted(execution.files.values()).count(b"") == 4
+    assert b"6" * 6000 in execution.files.values()
+    assert b"small" not in execution.files.values()
+
+
+@pytest.mark.parametrize("path", [
+    "/etc/escape", "../escape", "nested/../../escape", r"..\escape",
+    r"C:\escape", "C:escape", r"\escape", r"\\server\share\escape",
+    ".", "", "bad\0name", "a" * 241,
+])
+async def test_write_file_rejects_unsafe_paths_without_io(clock, path):
+    ch = make_challenge()
+    execution = FakeExecution()
+    solver = ReActSolver(
+        FakeLLM([LLMResponse(tool_calls=[ToolCall("write_file", {
+            "path": path, "content": "literal",
+        })])]), execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=1),
+    )
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP
+    assert execution.files == {}
+
+
+async def test_write_file_preserves_exact_utf8_and_tracks_revisions(clock):
+    ch = make_challenge()
+    contents = ["", "print('雪\\n')\r\n# `__** $() \\ \0", "final\n"]
+    responses = [
+        LLMResponse(tool_calls=[ToolCall("write_file", {
+            "path": r"scripts\solve.py", "content": content,
+        })])
+        for content in contents
+    ]
+    responses.append(LLMResponse())
+    llm = FakeLLM(responses)
+
+    class RecordingExecution(FakeExecution):
+        def __init__(self):
+            super().__init__()
+            self.writes = []
+
+        async def write_file(self, path, data):
+            self.writes.append((path, data))
+            await super().write_file(path, data)
+
+    execution = RecordingExecution()
+    solver = ReActSolver(
+        llm, execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=len(responses)),
+    )
+    await solver.solve(ch)
+    assert execution.writes == [
+        ("/ws/c1/scripts/solve.py", content.encode("utf-8")) for content in contents
+    ]
+    assert execution.files["/ws/c1/scripts/solve.py"] == b"final\n"
+    observations = [call["messages"][-1].content for call in llm.calls[1:]]
+    assert all("sha256=" in observation for observation in observations)
+    tool = next(tool for tool in llm.calls[0]["tools"] if tool.name == "write_file")
+    assert set(tool.schema["required"]) == {"path", "content"}
+
+
+@pytest.mark.parametrize("content", ["雪" * 22000, "\ud800", 123, None])
+async def test_write_file_rejects_invalid_or_oversized_content(clock, content):
+    ch = make_challenge()
+    execution = FakeExecution()
+    solver = ReActSolver(
+        FakeLLM([LLMResponse(tool_calls=[ToolCall("write_file", {
+            "path": "solve.py", "content": content,
+        })])]), execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=1),
+    )
+    await solver.solve(ch)
+    assert execution.files == {}
+
+
+async def test_write_file_adapter_error_is_an_observation_not_a_success(clock):
+    class FailingWrite(FakeExecution):
+        async def write_file(self, path, data):
+            raise OSError("disk unavailable")
+
+    ch = make_challenge()
+    llm = FakeLLM([
+        LLMResponse(tool_calls=[ToolCall("write_file", {"path": "a.py", "content": "x"})]),
+        LLMResponse(),
+    ])
+    solver = ReActSolver(
+        llm, FailingWrite(), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=2),
+    )
+    await solver.solve(ch)
+    context = llm.calls[-1]["messages"][-1].content
+    assert "disk unavailable" in context
+    assert "Wrote 1 UTF-8 bytes" not in context
+    assert solver.answers == {}
+
+
+@pytest.mark.parametrize("kind", ["react", "cli"])
+async def test_progress_checkpoints_precede_calls_and_question_refresh(clock, kind):
+    ch = make_challenge()
+    budget = Budget(max_turns=2)
+    snapshots = []
+
+    def checkpoint():
+        snapshots.append((
+            solver.turns, budget.used_turns, solver.input_tokens,
+            solver.output_tokens, dict(solver.answers),
+            list(solver.solved_questions), solver.tool_calls_made,
+        ))
+
+    class CancellingRefresh(FakePlatform):
+        async def get_challenge(self, cid):
+            assert snapshots[-1][4] == {"q1": "ctfy{win}"}
+            assert snapshots[-1][5] == ["q1"]
+            raise asyncio.CancelledError
+
+    platform = CancellingRefresh([ch])
+    if kind == "react":
+        class ReservedLLM(FakeLLM):
+            async def complete(self, messages, **kwargs):
+                assert snapshots == [(1, 1, 0, 0, {}, [], 0)]
+                return LLMResponse(
+                    tool_calls=[ToolCall("submit_flag", {"flag": "ctfy{win}"})],
+                    input_tokens=3, output_tokens=2,
+                )
+
+        solver = ReActSolver(
+            ReservedLLM(), FakeExecution(), platform, MessageBus(),
+            model="m", clock=clock, budget=budget, on_progress=checkpoint,
+        )
+    else:
+        class ReservedExecution(FakeExecution):
+            async def run(self, cmd, **kwargs):
+                assert snapshots == [(1, 1, 0, 0, {}, [], 1)]
+                return ExecResult(stdout="ctfy{win}")
+
+        solver = CliHarnessSolver(
+            ReservedExecution(), platform, cli="harness", clock=clock,
+            budget=budget, on_progress=checkpoint,
+        )
+    assert snapshots == []
+    with pytest.raises(asyncio.CancelledError):
+        await solver.solve(ch)
+    if kind == "react":
+        assert snapshots[1] == (1, 1, 3, 2, {}, [], 0)
+        assert budget.used_tokens == 5
+        assert len(snapshots) == 3
+    else:
+        assert len(snapshots) == 2
+    assert snapshots[-1][4:] == ({"q1": "ctfy{win}"}, ["q1"], 1)
+
+
+@pytest.mark.parametrize("kind", ["react", "cli"])
+async def test_expired_deadline_prevents_model_and_harness_turns(clock, kind):
+    ch = make_challenge()
+    budget = Budget(deadline=clock.now())
+    solver = _solver(kind, clock, FakePlatform([ch]), budget=budget)
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP
+    assert solver.turns == 0
+    assert solver.execution.commands == []
+    if kind == "react":
+        assert solver.llm.calls == []
+
+
+@pytest.mark.parametrize("kind", ["react", "cli"])
+async def test_command_timeouts_are_clamped_to_remaining_wall_time(clock, kind):
+    class TimedExecution(FakeExecution):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def run(self, cmd, *, timeout_s=60, workdir=None):
+            self.timeouts.append(timeout_s)
+            return ExecResult()
+
+    ch = make_challenge()
+    execution = TimedExecution()
+    budget = Budget(max_turns=1, deadline=clock.now() + 1.2)
+    if kind == "react":
+        solver = ReActSolver(
+            FakeLLM([LLMResponse(tool_calls=[
+                ToolCall("execute", {"cmd": "slow", "timeout_s": 600}),
+            ])]), execution, FakePlatform([ch]), MessageBus(),
+            model="m", clock=clock, budget=budget,
+        )
+    else:
+        solver = CliHarnessSolver(
+            execution, FakePlatform([ch]), cli="harness", clock=clock, budget=budget,
+        )
+    await solver.solve(ch)
+    assert execution.timeouts
+    assert set(execution.timeouts) == {2}
+
+
+@pytest.mark.parametrize("kind", ["react", "cli"])
+async def test_failed_call_keeps_reserved_turn_checkpoint(clock, kind):
+    snapshots = []
+    ch = make_challenge()
+    budget = Budget(max_turns=1)
+
+    def checkpoint():
+        snapshots.append((solver.turns, budget.used_turns, budget.used_tokens))
+
+    if kind == "react":
+        class FailingLLM(FakeLLM):
+            async def complete(self, messages, **kwargs):
+                raise RuntimeError("model unavailable")
+
+        solver = ReActSolver(
+            FailingLLM(), FakeExecution(), FakePlatform([ch]), MessageBus(),
+            model="m", clock=clock, budget=budget, on_progress=checkpoint,
+        )
+    else:
+        class FailingExecution(FakeExecution):
+            async def run(self, cmd, **kwargs):
+                raise RuntimeError("harness unavailable")
+
+        solver = CliHarnessSolver(
+            FailingExecution(), FakePlatform([ch]), cli="harness",
+            clock=clock, budget=budget, on_progress=checkpoint,
+        )
+    await solver.solve(ch)
+    assert snapshots == [(1, 1, 0)]
+    assert solver.turns == 1
+    assert solver.answers == {}
+
+
+async def test_wall_time_reclamped_after_setup_and_stops_cwd_probe(clock):
+    class AdvancingExecution(FakeExecution):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        async def run(self, cmd, *, timeout_s=60, workdir=None):
+            self.commands.append(cmd)
+            self.timeouts.append(timeout_s)
+            clock.advance(0.9 if cmd == "slow" else 1.4)
+            return ExecResult(stdout="new observation")
+
+    ch = make_challenge()
+    execution = AdvancingExecution()
+    solver = ReActSolver(
+        FakeLLM(lambda _: LLMResponse(tool_calls=[ToolCall("execute", {"cmd": "slow"})])),
+        execution, FakePlatform([ch]), MessageBus(), model="m", clock=clock,
+        budget=Budget(deadline=clock.now() + 2.2),
+    )
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP
+    assert execution.timeouts == [3, 1]
+    assert execution.commands[-1] == "slow"
+    assert solver.turns == 1
+
+
+async def test_missing_workspace_does_not_write_to_controller_path(clock):
+    class NoWorkspace(FakeExecution):
+        async def new_workspace(self, challenge_id):
+            raise OSError("workspace unavailable")
+
+    ch = make_challenge()
+    execution = NoWorkspace()
+    llm = FakeLLM([
+        LLMResponse(tool_calls=[ToolCall("write_file", {"path": "a.py", "content": "x"})]),
+        LLMResponse(),
+    ])
+    solver = ReActSolver(
+        llm, execution, FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=2),
+    )
+    await solver.solve(ch)
+    assert execution.files == {}
+    assert "workspace is unavailable" in llm.calls[-1]["messages"][-1].content
