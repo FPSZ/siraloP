@@ -58,13 +58,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ruby ruby-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# --- radare2 (not in Debian trixie): build from source; add r2pipe scripting ---
+# --- radare2 (not in Debian trixie): build from source, REAL (copy) install ----
 # The agent's go-to scriptable disassembler/analyzer (r2 -q -c '...', r2pipe).
-# Placed EARLY: this is the slowest layer (~7 min compile) but rarely changes, so
-# it stays cached while the volatile pip/agent layers below churn.
-RUN git clone --depth 1 https://github.com/radareorg/radare2 /opt/radare2 \
-    && /opt/radare2/sys/install.sh \
-    && rm -rf /opt/radare2/.git
+# `ninja install` COPIES r2 into /usr/local (unlike sys/install.sh, which SYMLINKS
+# the binaries/libs back into the build tree); that makes the ~0.5GB source+build
+# tree pure residue, removed here. Installed footprint ~55MB vs ~540MB for a kept
+# build tree. Libs land in /usr/local/lib/x86_64-linux-gnu, which is not on the
+# default loader path, so register it before ldconfig. Placed EARLY (slow ~7 min
+# compile, rarely changes) so the volatile pip/agent layers below reuse cache.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install meson ninja \
+    && git clone --depth 1 https://github.com/radareorg/radare2 /tmp/r2src \
+    && cd /tmp/r2src \
+    && meson setup build --prefix=/usr/local --buildtype=release -Dlocal=false \
+    && ninja -C build && ninja -C build install \
+    && echo '/usr/local/lib/x86_64-linux-gnu' > /etc/ld.so.conf.d/radare2.conf \
+    && ldconfig \
+    && cd / && rm -rf /tmp/r2src
 
 # --- Ruby gems (light, high-value; Tsinghua gem mirror) ------------------------
 RUN gem sources --add https://mirrors.tuna.tsinghua.edu.cn/rubygems/ \
