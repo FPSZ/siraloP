@@ -18,12 +18,15 @@ model = ["litellm>=1.40"]
 docker = ["aiodocker>=0.24"]
 # platform MCP transport
 mcp = ["mcp>=1.0"]
+# TSecBench (Tencent 云鼎) player API — adapters/platform/tsec_sdk.py imports it
+tsec = ["tsec-benchmark>=0.1.2"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
     "mypy>=1.10",
     "import-linter>=2.0",
+    "tsec-benchmark>=0.1.2",
 ]
 
 [project.scripts]
