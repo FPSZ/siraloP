@@ -23,11 +23,17 @@ T = TypeVar("T")
 
 class TransientError(Exception):
     """A failure worth retrying. ``retry_after`` (seconds), when the server sent
-    one, overrides the computed backoff."""
+    one, overrides the computed backoff. ``retryable`` is a structural marker
+    that lets a caller distinguish a recoverable provider error from a hard
+    failure without importing this adapter helper. Once the adapter's retry
+    budget is exhausted, ``exhausted`` is set so an outer loop does not multiply
+    the retry budget."""
 
     def __init__(self, message: str = "", *, retry_after: float | None = None) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.retryable = True
+        self.exhausted = False
 
 
 async def with_retry(
@@ -57,4 +63,5 @@ async def with_retry(
             delay = e.retry_after if e.retry_after is not None else backoff
             await clock.sleep(delay)
     assert last is not None  # loop body only exits via return or this re-raise
+    last.exhausted = True
     raise last

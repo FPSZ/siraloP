@@ -386,6 +386,7 @@ class ReActSolver:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.tool_calls_made: int = 0
+        self.failure_reason: str = ""
         # (question_id, answer) pairs the grader already rejected as WRONG, so we
         # neither resubmit an identical one (wasting a capped attempt) nor let the
         # model re-guess it. Keyed BY QUESTION: the same string can be wrong for
@@ -497,9 +498,13 @@ class ReActSolver:
         rejected = sorted({a for (qid, a) in self._rejected if qid in open_qids})
         if rejected:
             goal_lines.append(
-                "Already rejected by the grader as WRONG for the current open "
-                "question(s) (do NOT submit any of these again): "
-                + ", ".join(rejected[:8])
+                "Already rejected by the grader as WRONG (do NOT submit the same "
+                "answer for the same question again): "
+                + ", ".join(
+                    f"{qid}: {answer}" for qid, answer in sorted(
+                        pair for pair in self._rejected if pair[0] in open_qids
+                    )[:8]
+                )
             )
         if history:
             goal_lines.append(
@@ -602,8 +607,11 @@ class ReActSolver:
     async def solve(self, challenge: Challenge) -> RunStatus:
         try:
             workdir = await self.execution.new_workspace(challenge.id)
-        except Exception:
-            workdir = None
+        except Exception as exc:
+            self.failure_reason = (
+                f"workspace unavailable: {type(exc).__name__}: {str(exc)[:240]}"
+            )
+            return RunStatus.FAILED
 
         plan = self._seed_plan(challenge)
         # Working memory of the last K (command, observation) steps. Seeded with
@@ -642,13 +650,19 @@ class ReActSolver:
                     messages, model=self.model, effort="high",
                     tools=self._tools(challenge),
                 )
-            except Exception:
-                # Transient model-endpoint failure: don't abandon the challenge.
-                # Back off briefly and retry the turn; give up only after this
-                # keeps failing (bounded), so a flaky/rate-limited endpoint can't
-                # kill a lane that already has the artifact in hand.
+            except Exception as exc:
+                retryable = bool(getattr(exc, "retryable", False)) and not bool(
+                    getattr(exc, "exhausted", False)
+                )
+                if not retryable:
+                    self.failure_reason = f"{type(exc).__name__}: {str(exc)[:240]}"
+                    return self._final_status(challenge, RunStatus.GIVEN_UP)
+                # A retryable model-endpoint failure is allowed a small outer-loop
+                # budget for fakes/local providers. Gateway adapters mark an
+                # exhausted inner retry so this loop cannot multiply requests.
                 llm_errors += 1
                 if llm_errors >= _LLM_ERROR_CAP:
+                    self.failure_reason = f"{type(exc).__name__}: {str(exc)[:240]}"
                     return self._final_status(challenge, RunStatus.GIVEN_UP)
                 await self.clock.sleep(_LLM_ERROR_BACKOFF_S)
                 continue
@@ -1063,6 +1077,7 @@ class CliHarnessSolver:
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.tool_calls_made: int = 0
+        self.failure_reason: str = ""
 
     def _briefing(self, challenge: Challenge) -> str:
         lines = [
@@ -1093,8 +1108,11 @@ class CliHarnessSolver:
     async def solve(self, challenge: Challenge) -> RunStatus:
         try:
             workdir = await self.execution.new_workspace(challenge.id)
-        except Exception:
-            workdir = None
+        except Exception as exc:
+            self.failure_reason = (
+                f"workspace unavailable: {type(exc).__name__}: {str(exc)[:240]}"
+            )
+            return RunStatus.FAILED
 
         # The prompt is passed as a single-arg payload the adapter is responsible
         # for quoting; the CLI runs non-interactively. Treat its output as data.

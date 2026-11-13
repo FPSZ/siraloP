@@ -307,24 +307,17 @@ async def test_start_instance_benchmark_vpn_service_is_raw_tcp():
 
 
 async def test_start_instance_returns_existing_on_duplicate_429():
-    # The port contract is "Start (or return)": the caller polls readiness by
-    # re-calling start_instance, so a second create collides with the instance we
-    # already hold and the platform 429s the duplicate. Rather than fail the solve
-    # (and orphan the instance it already made), the adapter looks our instance up
-    # for this challenge and returns it ready.
+    # The port contract is "Start (or return)": after the first create, polling
+    # must use the cached instance id instead of creating a duplicate.
     calls: list[str] = []
+    creates = 0
 
     def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal creates
         calls.append(f"{req.method} {req.url.path}")
         if req.method == "POST":
-            return httpx.Response(429, json={"code": "rate_limited"})
-        if req.url.path == "/api/v1/instances":
-            return httpx.Response(
-                200,
-                json={"items": [
-                    {"id": "inst-7", "challenge_id": "SAMPLE-001", "status": "ready"}
-                ]},
-            )
+            creates += 1
+            return httpx.Response(202, json={"id": "inst-7", "status": "starting"})
         assert req.url.path == "/api/v1/instances/inst-7"
         return httpx.Response(
             200,
@@ -338,14 +331,14 @@ async def test_start_instance_returns_existing_on_duplicate_429():
             },
         )
 
-    inst = await _adapter(handler, FakeClock()).start_instance("SAMPLE-001")
-    assert inst.id == "inst-7"
-    assert inst.status is InstanceStatus.READY
-    assert inst.host == "inst-7.chal.ctfy.run"
-    # the duplicate create 429'd (retried to exhaustion), then "or return" won
-    assert calls.count("POST /api/v1/instances") == 4
-    assert "GET /api/v1/instances" in calls
-    assert "GET /api/v1/instances/inst-7" in calls
+    adapter = _adapter(handler, FakeClock())
+    first = await adapter.start_instance("SAMPLE-001")
+    second = await adapter.start_instance("SAMPLE-001")
+    assert first.id == second.id == "inst-7"
+    assert second.status is InstanceStatus.READY
+    assert second.host == "inst-7.chal.ctfy.run"
+    assert creates == 1
+    assert calls.count("GET /api/v1/instances/inst-7") == 2
 
 
 async def test_start_instance_reraises_429_without_our_instance():

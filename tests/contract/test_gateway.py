@@ -189,6 +189,36 @@ async def test_retries_429_then_succeeds_via_clock():
     assert clock.slept == [3.0]  # honored the Retry-After, via the clock (no real wait)
 
 
+async def test_quota_429_is_not_retried():
+    calls = 0
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "1310",
+                    "message": "weekly quota exhausted",
+                }
+            },
+        )
+
+    clock = FakeClock()
+    gateway = GatewayAdapter(
+        "https://gw.test", "k", "anthropic", clock=clock, client=_client(handler)
+    )
+    try:
+        with pytest.raises(RuntimeError, match="quota"):
+            await gateway.complete([Msg("user", "u")], model="m")
+    finally:
+        await gateway.aclose()
+    assert calls == 1
+    assert clock.slept == []
+
+
 async def test_hard_4xx_raises_runtimeerror():
     def handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="forbidden")

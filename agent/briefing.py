@@ -64,8 +64,13 @@ def load_task(settings: Settings) -> Task:
     mt = raw.get("max_turns", settings.max_turns)
     max_turns = mt if mt is None or isinstance(mt, int) else settings.max_turns
 
+    raw_mode = raw.get("run_mode")
+    if raw_mode not in (None, ""):
+        if not isinstance(raw_mode, str) or raw_mode not in {mode.value for mode in RunMode}:
+            raise ValueError(f"unknown run_mode: {raw_mode!r}")
+
     return Task(
-        run_mode=RunMode.parse(raw.get("run_mode")),
+        run_mode=RunMode.parse(raw_mode),
         schema_version=int(raw.get("schema_version", 2) or 2),
         challenge=challenge,
         competition_id=str(raw.get("competition_id", settings.competition_id) or ""),

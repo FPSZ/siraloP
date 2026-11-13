@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -25,6 +26,7 @@ from agent.domain.state import ExecResult
 IS_WINDOWS = os.name == "nt"
 
 _REAP_TIMEOUT_S = 5.0
+_WORKSPACE_NAME = re.compile(r"-ws\d+$")
 _CREDENTIAL_NAMES = (
     "CTFY_TOKEN", "LLM_API_KEY", "OPENAI_API_KEY", "OPENAI_AUTH_TOKEN",
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
@@ -183,13 +185,20 @@ class SubprocessAdapter:
         def _mk() -> str:
             d = os.path.abspath(os.path.join(self._root, f"{safe}-ws{n}"))
             os.makedirs(d, exist_ok=True)
-            try:  # seed attachments (top-level files staged under the root)
-                for name in os.listdir(self._root):
-                    src = os.path.join(self._root, name)
-                    if os.path.isfile(src):
-                        shutil.copy2(src, os.path.join(d, name))
-            except OSError:
-                pass
+            # Seed all staged files and directories, while excluding workspaces
+            # created by this adapter (or a previous process) so one attempt
+            # cannot inherit another attempt's mutable state.
+            for name in os.listdir(self._root):
+                src = os.path.join(self._root, name)
+                if os.path.abspath(src) == d:
+                    continue
+                if os.path.isdir(src) and _WORKSPACE_NAME.search(name):
+                    continue
+                dst = os.path.join(d, name)
+                if os.path.isfile(src):
+                    shutil.copy2(src, dst)
+                elif os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
             return d
 
         return await loop.run_in_executor(None, _mk)
@@ -411,26 +420,65 @@ builtin source {command_path}
             lookahead = max(0, max_span - 1)
             captured: list[str] = []
             captured_length = 0
+            overflowed = False
+            tail: list[str] = []
             pending = ""
             discarded = False
             proc: asyncio.subprocess.Process | None = None
             job: WindowsJob | None = None
 
+            head_limit = (output_cap * 4) // 5
+            tail_limit = output_cap - head_limit
+
+            def rendered() -> str:
+                return "".join(captured) + "".join(tail)
+
             def emit(text: str) -> None:
-                nonlocal captured_length, discarded
+                nonlocal captured_length, discarded, overflowed, captured, tail
+                if not text:
+                    return
                 clean = redact(text, extra_secrets=secrets, redact_bearer=False)
+                if overflowed:
+                    discarded = True
+                    if tail_limit:
+                        tail_text = "".join(tail) + clean
+                        tail = [tail_text[-tail_limit:]]
+                    return
                 remaining = output_cap - captured_length
-                head = clean[:remaining]
-                if head:
-                    captured.append(head)
-                    captured_length += len(head)
-                discarded |= len(clean) > remaining
+                if len(clean) <= remaining:
+                    captured.append(clean)
+                    captured_length += len(clean)
+                    return
+                prefix = clean[:remaining]
+                if prefix:
+                    captured.append(prefix)
+                    captured_length += len(prefix)
+                overflowed = True
+                discarded = True
+                existing = "".join(captured)
+                head = existing[:head_limit]
+                tail_text = existing[head_limit:] + clean[remaining:]
+                captured = [head] if head else []
+                tail = [tail_text[-tail_limit:]] if tail_limit else []
 
             def consume(text: str, *, final: bool = False) -> None:
                 nonlocal pending, discarded
-                if captured_length >= output_cap:
-                    discarded |= bool(text or pending)
-                    pending = ""
+                if overflowed:
+                    pending += text
+                    while pending:
+                        safe_length = (
+                            len(pending) if final else max(0, len(pending) - lookahead)
+                        )
+                        if not safe_length:
+                            break
+                        match = matcher.search(pending) if matcher is not None else None
+                        boundary = (
+                            match.end()
+                            if match is not None and match.start() < safe_length
+                            else safe_length
+                        )
+                        emit(pending[:boundary])
+                        pending = pending[boundary:]
                     return
                 pending += text
                 while pending:
@@ -497,7 +545,10 @@ builtin source {command_path}
                 code = await asyncio.wait_for(asyncio.shield(collector), timeout_s)
             except TimeoutError:
                 await self._discard(proc, job, collector)
-                return ExecResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+                return ExecResult(
+                    stdout=rendered(), stderr="", exit_code=-1,
+                    timed_out=True, truncated=discarded,
+                )
             except asyncio.CancelledError:
                 if proc is None and spawn is not None:
                     try:
@@ -519,7 +570,7 @@ builtin source {command_path}
                     os.close(command_fd)
             self._prune_completed_groups()
             return ExecResult(
-                stdout="".join(captured), stderr="", exit_code=code,
+                stdout=rendered(), stderr="", exit_code=code,
                 timed_out=False, truncated=discarded,
             )
 

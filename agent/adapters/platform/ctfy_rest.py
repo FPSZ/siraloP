@@ -193,6 +193,16 @@ class CtfyRestAdapter:
         return parsed
 
     async def start_instance(self, cid: str) -> Instance:
+        cached_id = self._instance_ids.get(cid)
+        if cached_id:
+            detail = await self._get_instance_detail(cached_id)
+            if detail is not None:
+                cached = self._instance_from_detail(detail, fallback_id=cached_id)
+                if cached.status not in (InstanceStatus.STOPPED, InstanceStatus.ERROR):
+                    return cached
+            # A stopped/expired instance no longer satisfies "return"; permit a
+            # fresh create on the next path.
+            self._instance_ids.pop(cid, None)
         # The POST body MUST carry competition_id: without it the platform routes
         # the start to the account's default (Agent Track) competition, which is
         # paused outside a session and 403s (verified against the live API). When

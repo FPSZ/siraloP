@@ -61,6 +61,15 @@ async def test_timeout_kills_and_flags():
     assert res.timed_out is True  # returned, not raised
 
 
+async def test_timeout_preserves_output_captured_before_kill():
+    res = await _once(
+        f"{PY} -c \"import time; print('before-timeout', flush=True); time.sleep(30)\"",
+        timeout_s=1,
+    )
+    assert res.timed_out is True
+    assert "before-timeout" in res.stdout
+
+
 async def test_output_is_truncated():
     a = SubprocessAdapter(output_cap=20)
     try:
@@ -69,6 +78,19 @@ async def test_output_is_truncated():
         await a.aclose()
     assert res.truncated is True
     assert len(res.stdout) + len(res.stderr) <= 20
+    assert res.stdout.startswith("x" * 16)
+
+
+async def test_output_capture_keeps_tail_marker():
+    adapter = SubprocessAdapter(output_cap=64)
+    try:
+        res = await adapter.run(
+            f"{PY} -c \"import sys; sys.stdout.write('x'*1000+'TAIL_MARKER')\"",
+        )
+    finally:
+        await adapter.aclose()
+    assert res.truncated is True
+    assert "TAIL_MARKER" in res.stdout
 
 
 async def test_shell_session_persists_cwd_and_env():
@@ -91,6 +113,8 @@ async def test_new_workspace_is_unique_and_seeded(tmp_path):
     # Each workspace is distinct (racing lanes never share shell state) and is
     # seeded with the files staged under the adapter root (the attachments).
     (tmp_path / "archive.zip").write_bytes(b"PK\x03\x04seed")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "sample.bin").write_bytes(b"nested-seed")
     a = SubprocessAdapter(root=str(tmp_path))
     try:
         ws1 = await a.new_workspace("c1")
@@ -98,6 +122,8 @@ async def test_new_workspace_is_unique_and_seeded(tmp_path):
         assert ws1 != ws2
         assert os.path.isfile(os.path.join(ws1, "archive.zip"))
         assert os.path.isfile(os.path.join(ws2, "archive.zip"))
+        assert os.path.isfile(os.path.join(ws1, "assets", "sample.bin"))
+        assert os.path.isfile(os.path.join(ws2, "assets", "sample.bin"))
     finally:
         await a.aclose()
 
@@ -387,11 +413,14 @@ async def test_repeated_secrets_and_chunk_boundaries_cannot_leak_truncated_key(m
         repeated = await adapter.run(_python(f"import sys;sys.stdout.write({secret!r}*10000)"))
         assert repeated.exit_code == 0
         assert repeated.truncated
-        assert repeated.stdout == (redact(secret, redact_bearer=False) * 10000)[:3000]
+        expected = redact(secret, redact_bearer=False) * 10000
+        assert len(repeated.stdout) == 3000
+        assert repeated.stdout.startswith(expected[:2400])
+        assert repeated.stdout.endswith(expected[-600:])
         boundary = await adapter.run(_python(f"import sys;sys.stdout.write('x'*2990+{secret!r})"))
         assert boundary.exit_code == 0
         assert "synthetic" not in boundary.stdout
-        assert boundary.stdout.startswith("x" * 2990)
+        assert boundary.stdout.startswith("x" * 2400)
         unicode_secret = "synthetic-control-雪-credential"
         monkeypatch.setenv("OPENAI_AUTH_TOKEN", unicode_secret)
         encoded = json.dumps(unicode_secret, ensure_ascii=True)[1:-1]

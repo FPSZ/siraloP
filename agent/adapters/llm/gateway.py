@@ -144,6 +144,11 @@ class GatewayAdapter:
                 message = redact(str(e), extra_secrets=(self.api_key,))
                 raise TransientError(f"gateway transport error: {message}") from None
             status = resp.status_code
+            if status == 429 and self._quota_error(resp) is not None:
+                code, detail = self._quota_error(resp) or ("unknown", "quota exhausted")
+                raise RuntimeError(
+                    f"gateway quota exhausted (code={code}): {detail}"
+                )
             if status == 429 or status >= 500:
                 raise TransientError(
                     f"gateway {status}",
@@ -162,6 +167,28 @@ class GatewayAdapter:
             return parse(data)
 
         return await with_retry(_do, clock=self.clock, label=f"gateway:{self.flavor}")
+
+    def _quota_error(self, resp: httpx.Response) -> tuple[str, str] | None:
+        """Return a safe quota marker for non-recoverable rate-limit responses."""
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        error = data.get("error") if isinstance(data, dict) else None
+        payload = error if isinstance(error, dict) else data if isinstance(data, dict) else {}
+        code = str(payload.get("code", "")).strip()
+        message = str(
+            payload.get("message") or payload.get("detail") or payload.get("error") or ""
+        ).strip()
+        lowered = f"{code} {message}".lower()
+        quota_words = (
+            "quota", "weekly", "monthly", "usage limit", "rate limit exceeded",
+            "限额", "使用上限", "额度",
+        )
+        if code == "1310" or any(word in lowered for word in quota_words):
+            safe = redact(message, extra_secrets=(self.api_key,))[:500]
+            return code or "unknown", safe or "provider quota exhausted"
+        return None
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client (no-op if one was injected elsewhere)."""

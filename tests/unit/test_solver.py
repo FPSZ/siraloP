@@ -420,6 +420,9 @@ async def test_persistent_model_errors_give_up_gracefully_not_by_raising(clock):
     # mid-solve (the bug: one raised 429/5xx ended a run at turn 3 with the
     # artifact already in hand). The loop retries with back-off and gives up
     # gracefully only after _LLM_ERROR_CAP consecutive failures.
+    class RetryableFailure(RuntimeError):
+        retryable = True
+
     class AlwaysFailingLLM(FakeLLM):
         def __init__(self) -> None:
             super().__init__(lambda _m: LLMResponse())
@@ -428,7 +431,7 @@ async def test_persistent_model_errors_give_up_gracefully_not_by_raising(clock):
         async def complete(self, messages, **kwargs):
             self.n += 1
             await asyncio.sleep(0)
-            raise RuntimeError("provider failed")
+            raise RetryableFailure("provider failed")
 
     ch = make_challenge()
     budget = Budget(max_turns=50)  # high: the error cap, not the budget, must stop us
@@ -445,9 +448,34 @@ async def test_persistent_model_errors_give_up_gracefully_not_by_raising(clock):
     assert budget.used_tokens == 0
 
 
+async def test_non_retryable_llm_failure_stops_immediately(clock):
+    class AlwaysFailingLLM(FakeLLM):
+        def __init__(self) -> None:
+            super().__init__(lambda _m: LLMResponse())
+            self.n = 0
+
+        async def complete(self, messages, **kwargs):
+            self.n += 1
+            raise RuntimeError("quota exhausted")
+
+    ch = make_challenge()
+    llm = AlwaysFailingLLM()
+    solver = ReActSolver(
+        llm, FakeExecution(), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=50),
+    )
+
+    assert await solver.solve(ch) is RunStatus.GIVEN_UP
+    assert llm.n == 1
+    assert solver.failure_reason == "RuntimeError: quota exhausted"
+
+
 async def test_recovers_after_a_transient_model_error(clock):
     # Fail once, then submit the correct flag: the lane survives the hiccup and
     # goes on to solve instead of dying on the first error.
+    class RetryableFailure(RuntimeError):
+        retryable = True
+
     class FlakyLLM(FakeLLM):
         def __init__(self) -> None:
             super().__init__(lambda _m: LLMResponse())
@@ -456,7 +484,7 @@ async def test_recovers_after_a_transient_model_error(clock):
         async def complete(self, messages, **kwargs):
             self.n += 1
             if self.n == 1:
-                raise RuntimeError("transient 503")
+                raise RetryableFailure("transient 503")
             return LLMResponse(
                 tool_calls=[ToolCall("submit_flag", {"flag": "ctfy{win}", "question_id": "q1"})]
             )
@@ -668,6 +696,18 @@ async def test_clipped_middle_output_is_retrievable_from_artifact(clock):
     assert path in older
 
 
+def test_rejected_answer_context_keeps_question_id(clock):
+    ch = make_challenge("c1", n_questions=2)
+    solver = ReActSolver(
+        FakeLLM(), FakeExecution(), FakePlatform([ch]), MessageBus(),
+        model="m", clock=clock, budget=Budget(max_turns=1),
+    )
+    solver._rejected.add(("q1", "42"))
+    context = solver._build_context(ch, [], [])[1].content
+    assert "q1: 42" in context
+    assert "current open question(s)" not in context
+
+
 async def test_output_artifact_slots_rotate_and_small_output_needs_none(clock):
     ch = make_challenge()
     execution = FakeExecution({
@@ -746,7 +786,11 @@ async def test_write_file_preserves_exact_utf8_and_tracks_revisions(clock):
     assert set(tool.schema["required"]) == {"path", "content"}
 
 
-@pytest.mark.parametrize("content", ["雪" * 22000, "\ud800", 123, None])
+@pytest.mark.parametrize(
+    "content",
+    ["雪" * 22000, "\ud800", 123, None],
+    ids=["oversized", "invalid_unicode", "not_string", "none"],
+)
 async def test_write_file_rejects_invalid_or_oversized_content(clock, content):
     ch = make_challenge()
     execution = FakeExecution()
@@ -943,14 +987,12 @@ async def test_missing_workspace_does_not_write_to_controller_path(clock):
 
     ch = make_challenge()
     execution = NoWorkspace()
-    llm = FakeLLM([
-        LLMResponse(tool_calls=[ToolCall("write_file", {"path": "a.py", "content": "x"})]),
-        LLMResponse(),
-    ])
+    llm = FakeLLM()
     solver = ReActSolver(
         llm, execution, FakePlatform([ch]), MessageBus(),
         model="m", clock=clock, budget=Budget(max_turns=2),
     )
-    await solver.solve(ch)
+    assert await solver.solve(ch) is RunStatus.FAILED
     assert execution.files == {}
-    assert "workspace is unavailable" in llm.calls[-1]["messages"][-1].content
+    assert llm.calls == []
+    assert solver.failure_reason.startswith("workspace unavailable:")

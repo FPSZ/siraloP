@@ -60,6 +60,23 @@ async def test_run_survives_platform_error(clock):
     assert result.fully_solved is False
 
 
+async def test_model_failure_is_reported_in_stop_reason(clock):
+    class QuotaLLM(FakeLLM):
+        async def complete(self, messages, **kwargs):
+            raise RuntimeError("gateway quota exhausted (code=1310)")
+
+    challenge = make_challenge("quota", difficulty="hard")
+    result = await Coordinator(
+        FakePlatform([challenge]), QuotaLLM(), FakeExecution(),
+        RecordingResultSink(), clock=clock,
+    ).run()
+
+    assert result.fully_solved is False
+    assert result.stop_reason == (
+        "error on quota: RuntimeError: gateway quota exhausted (code=1310)"
+    )
+
+
 @pytest.mark.parametrize(
     "challenge",
     [

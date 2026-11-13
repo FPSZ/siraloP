@@ -301,7 +301,14 @@ class Coordinator:
         )
         swarm = Swarm(strategies, clock=self.clock, max_lanes=max(lane_max, 1))
         try:
-            return await swarm.solve(challenge)
+            status = await swarm.solve(challenge)
+            if status is not RunStatus.SOLVED:
+                for lane in lanes:
+                    reason = getattr(lane, "failure_reason", "")
+                    if reason:
+                        result.stop_reason = f"error on {challenge.id}: {reason}"
+                        break
+            return status
         finally:
             checkpoint()
 

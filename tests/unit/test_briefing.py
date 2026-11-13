@@ -113,3 +113,11 @@ def test_question_mode_from_real_api_is_preserved(tmp_path):
 
     assert task.challenge is not None
     assert task.challenge.unanswered()[0].fmt == "single"
+
+
+def test_unknown_run_mode_is_rejected_at_briefing_boundary(tmp_path):
+    (tmp_path / "task.json").write_text(
+        json.dumps({"run_mode": "future-mode"}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="unknown run_mode"):
+        load_task(Settings(work_dir=str(tmp_path)))
